@@ -1,5 +1,7 @@
 # Card Cabinet
 
+[Open Card Cabinet](https://poemofthanathos.github.io/card-cabinet/). Choose **Add test cards** to try the app with 12 fictional cards. Each browser keeps its own collection.
+
 A personal card collection app for iPhone Safari and Windows Edge or Chrome. Manual entry, photos, editing, search and backups work without an account. Firebase metadata sync and OpenAI identification are optional.
 
 The app has no card-count limit or subscription. Device storage and service quotas still apply. Firebase and OpenAI identification require the owner's configuration. No paid API requests were made during development.
@@ -68,9 +70,11 @@ CSV export includes metadata and photo hashes, with a UTF-8 BOM for Japanese tex
 
 Keep at least one verified package outside the browser after adding photos. Browser storage can be erased or evicted. Settings shows the browser's estimate and can request persistent storage where supported. Persistence and installation do not replace backups. See [WebKit's storage policy](https://webkit.org/blog/14403/updates-to-storage-policy/).
 
-## Publish to GitHub Pages when you choose
+## GitHub Pages
 
-The repository is [PoemofThanathos/card-cabinet](https://github.com/PoemofThanathos/card-cabinet). The instructions below cover enabling Pages and setting up another owner-controlled copy. They do not grant downstream users rights beyond the license.
+The app is published at [poemofthanathos.github.io/card-cabinet](https://poemofthanathos.github.io/card-cabinet/). The repository is [PoemofThanathos/card-cabinet](https://github.com/PoemofThanathos/card-cabinet), with GitHub Actions selected as the Pages source. Pushes to `main` run the tests, build the app and deploy it. Firebase sync and OpenAI identification remain unconfigured; local collection features work without them.
+
+The setup instructions below are for another owner-controlled copy. They do not grant downstream users rights beyond the license.
 
 GitHub Free supports Pages from public repositories. Private repository Pages requires an eligible paid plan. Do not assume a free private repository can host this app. [GitHub's current Pages requirements](https://docs.github.com/en/pages/getting-started-with-github-pages/what-is-github-pages)
 

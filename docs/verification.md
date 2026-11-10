@@ -1,6 +1,6 @@
 # Verification record
 
-Updated 9 November 2026. Tests use generated fixtures, fake credentials, mocks and the local Firestore emulator. No real card photos or paid OpenAI calls were used.
+Updated 10 November 2026. Tests use generated fixtures, fake credentials, mocks and the local Firestore emulator. No real card photos or paid OpenAI calls were used.
 
 ## Implemented
 
@@ -38,9 +38,15 @@ The checks cover:
 
 Browser tests exposed a Windows WebKit Blob-to-IndexedDB failure. Photo storage now uses image bytes, with a migration for existing Blob rows. They also exposed a draft-close race; the editor now waits for the draft write before closing. A local preview base-path mismatch was corrected in the test runner. The production workflow already supplies the Pages base path.
 
+## Published app
+
+GitHub Pages is enabled with GitHub Actions as its source. The [deployment](https://github.com/PoemofThanathos/card-cabinet/actions/runs/42802588916) passed dependency installation, all 50 unit/integration tests, the production build and deployment. The live app is at [poemofthanathos.github.io/card-cabinet](https://poemofthanathos.github.io/card-cabinet/).
+
+The live app was opened in Brave. Adding test cards created 12 cards with 24 images in six sets. The set detail list, All cards list and Players grid worked, and the cards remained after reload. The app displayed its offline-ready message. This live check did not disable the browser's network; offline reopening was covered by the earlier Chromium production-build tests.
+
 ## Not verified by these checks
 
-No live Firebase account was configured, no Worker or Pages deployment was created, and no real OpenAI identification was requested. Account-specific service access, billing setup, quota behavior and Worker CPU headroom still need the owner's setup and approval. The Worker dry run and mocked calls cannot establish production behavior.
+No live Firebase account was configured, no Worker was deployed, and no real OpenAI identification was requested. Account-specific service access, billing setup, quota behavior and Worker CPU headroom still need the owner's setup and approval. The Worker dry run and mocked calls cannot establish production behavior.
 
 No physical iPhone was available. Camera permissions, HEIC decoding, EXIF orientation on actual camera files, Home Screen installation, offline reopening, updates, Files export and phone memory limits remain on the [manual checklist](device-checklist.md). Playwright WebKit is not an iPhone test.
 
