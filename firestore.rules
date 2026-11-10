@@ -1,8 +1,8 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Replace this exact placeholder with the one personal Firebase Authentication UID.
-    function owner(uid) { return request.auth != null && request.auth.uid == uid && uid == 'REPLACE_WITH_OWNER_UID'; }
+    // Only this personal Firebase Authentication account can access the collection.
+    function owner(uid) { return request.auth != null && request.auth.uid == uid && uid == 'gBiqwPJN24XMSUDHIEejPBLyvKp2'; }
     function uuid(s) { return s is string && s.matches('^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'); }
     function hash(s) { return s == null || (s is string && s.matches('^[a-f0-9]{64}$')); }
     function fieldsValid(f) {

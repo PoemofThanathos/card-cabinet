@@ -4,7 +4,7 @@
 
 A personal card collection app for iPhone Safari and Windows Edge or Chrome. Manual entry, photos, editing, search and backups work without an account. Firebase metadata sync and OpenAI identification are optional.
 
-The app has no card-count limit or subscription. Device storage and service quotas still apply. Firebase and OpenAI identification require the owner's configuration. No paid API requests were made during development.
+The app has no card-count limit or subscription. Device storage and service quotas still apply. The published app has Firebase configured for its owner's account. OpenAI identification still requires configuration. No paid API requests were made during development.
 
 ## License
 
@@ -72,7 +72,7 @@ Keep at least one verified package outside the browser after adding photos. Brow
 
 ## GitHub Pages
 
-The app is published at [poemofthanathos.github.io/card-cabinet](https://poemofthanathos.github.io/card-cabinet/). The repository is [PoemofThanathos/card-cabinet](https://github.com/PoemofThanathos/card-cabinet), with GitHub Actions selected as the Pages source. Pushes to `main` run the tests, build the app and deploy it. Firebase sync and OpenAI identification remain unconfigured; local collection features work without them.
+The app is published at [poemofthanathos.github.io/card-cabinet](https://poemofthanathos.github.io/card-cabinet/). The repository is [PoemofThanathos/card-cabinet](https://github.com/PoemofThanathos/card-cabinet), with GitHub Actions selected as the Pages source. Pushes to `main` run the tests, build the app and deploy it. Firebase metadata sync is configured for the owner's account. OpenAI identification remains unconfigured.
 
 The setup instructions below are for another owner-controlled copy. They do not grant downstream users rights beyond the license.
 
@@ -112,11 +112,15 @@ Static hosting cannot protect secrets embedded in its JavaScript. Only the publi
 
 ## Optional Firebase metadata sync
 
+The published app uses the Spark project `card-cabinet-a1d92`, with email/password sign-in and a Firestore Standard database in `southamerica-east1`, São Paulo. The rules permit only the configured owner UID. The GitHub Pages hostname is authorized, and the five public Firebase/owner settings are stored as GitHub Actions variables. Photos remain local. Analytics, Cloud Storage and paid backups are not enabled.
+
+On each device, open Settings, sign in with the personal account created in Firebase Authentication, choose Link this collection, then Sync now. Linking confirms that card metadata, including notes and purchase details, may upload. Use a full backup package to transfer photos. The setup below applies when the owner creates a different Firebase project.
+
 Firebase Spark needs no payment information. Do not link a Cloud Billing account, because linking billing upgrades the project to Blaze. This app does not use Firebase Functions or Cloud Storage. [Firebase plan documentation](https://firebase.google.com/docs/projects/billing/firebase-pricing-plans)
 
 1. In the Firebase console, create a project on Spark. Analytics is unnecessary for this app.
 2. Add a Web app. Copy its public `apiKey`, `authDomain`, `projectId` and `appId` into a local `.env` file based on `.env.example`. These values identify the Firebase app; they are not the OpenAI secret.
-3. Open Authentication, enable Email/Password, then add your one personal user in the console. Copy its UID. Put it in `VITE_OWNER_UID` and replace `REPLACE_WITH_OWNER_UID` in `firestore.rules`. The app deliberately has no public sign-up.
+3. Open Authentication, enable Email/Password, then add your one personal user in the console. Copy its UID. Put it in `VITE_OWNER_UID` and replace the configured UID in the `owner` function in `firestore.rules`. The app deliberately has no public sign-up screen. The rules enforce which account can access the collection.
 4. Create one Cloud Firestore Standard database, using Native mode. Choose a region you are comfortable using. Keep Spark and choose production rules, not an open test-mode database.
 5. Publish this project's `firestore.rules` through the console's Rules tab. Alternatively, after installing dependencies, run `npx firebase login`, then `npx firebase deploy --only firestore:rules,firestore:indexes --project YOUR_PROJECT_ID`. This publishes rules and indexes only. Do not run a broad deploy or enable billing.
 6. Add the Pages hostname to Authentication > Settings > Authorized domains where required. A hostname has no `/card-cabinet/` path. Add `localhost` separately if you want local login.

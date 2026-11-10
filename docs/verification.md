@@ -44,9 +44,17 @@ GitHub Pages is enabled with GitHub Actions as its source. The [deployment](http
 
 The live app was opened in Brave. Adding test cards created 12 cards with 24 images in six sets. The set detail list, All cards list and Players grid worked, and the cards remained after reload. The app displayed its offline-ready message. This live check did not disable the browser's network; offline reopening was covered by the earlier Chromium production-build tests.
 
+## Firebase setup
+
+Firebase is configured on the no-cost Spark plan for project `card-cabinet-a1d92`. The web app, personal email/password account, authorized GitHub Pages domain, Firestore Standard database in São Paulo and card-field index exemption were created. Owner-only rules were published after all five Firestore emulator tests passed against the configured rules. The tests now read the configured UID and exercise the actual rules without replacing their access condition. An unauthenticated read of the live database returned HTTP 403.
+
+The GitHub Actions variables include the public Firebase configuration and owner UID.
+
 ## Not verified by these checks
 
-No live Firebase account was configured, no Worker was deployed, and no real OpenAI identification was requested. Account-specific service access, billing setup, quota behavior and Worker CPU headroom still need the owner's setup and approval. The Worker dry run and mocked calls cannot establish production behavior.
+A live signed-in sync still needs the owner to sign in, link the local collection and choose Sync now. Emulator tests cannot establish account-specific quota behavior.
+
+No Worker was deployed, and no real OpenAI identification was requested. Worker setup, quota behavior and CPU headroom still need the owner's setup and approval. The Worker dry run and mocked calls cannot establish production behavior.
 
 No physical iPhone was available. Camera permissions, HEIC decoding, EXIF orientation on actual camera files, Home Screen installation, offline reopening, updates, Files export and phone memory limits remain on the [manual checklist](device-checklist.md). Playwright WebKit is not an iPhone test.
 

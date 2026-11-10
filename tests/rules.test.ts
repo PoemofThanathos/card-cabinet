@@ -17,6 +17,9 @@ import {
 } from 'firebase/firestore';
 import { readFileSync } from 'node:fs';
 import { newCard } from '../src/model';
+const rules = readFileSync('firestore.rules', 'utf8');
+const ownerUid = rules.match(/&& uid == '([^']+)'/)?.[1];
+if (!ownerUid) throw new Error('The rules must declare one configured owner UID.');
 let env: RulesTestEnvironment;
 beforeAll(async () => {
   env = await initializeTestEnvironment({
@@ -24,7 +27,7 @@ beforeAll(async () => {
     firestore: {
       host: '127.0.0.1',
       port: 8080,
-      rules: readFileSync('firestore.rules', 'utf8').replaceAll('REPLACE_WITH_OWNER_UID', 'owner'),
+      rules,
     },
   });
 });
@@ -33,8 +36,8 @@ afterAll(() => env.cleanup());
 const record = () => ({ rev: 1, mutationId: crypto.randomUUID(), card: newCard() });
 it('permits only the configured UID and isolates paths', async () => {
   const r = record();
-  const path = 'users/owner/cards/' + r.card.id;
-  await assertSucceeds(setDoc(doc(env.authenticatedContext('owner').firestore(), path), r));
+  const path = `users/${ownerUid}/cards/` + r.card.id;
+  await assertSucceeds(setDoc(doc(env.authenticatedContext(ownerUid).firestore(), path), r));
   await assertFails(getDoc(doc(env.unauthenticatedContext().firestore(), path)));
   await assertFails(getDoc(doc(env.authenticatedContext('other').firestore(), path)));
   await assertFails(
@@ -43,7 +46,10 @@ it('permits only the configured UID and isolates paths', async () => {
 });
 it('rejects photo payloads, extra keys, oversized fields and wrong IDs', async () => {
   const r = record();
-  const ref = doc(env.authenticatedContext('owner').firestore(), 'users/owner/cards/' + r.card.id);
+  const ref = doc(
+    env.authenticatedContext(ownerUid).firestore(),
+    `users/${ownerUid}/cards/` + r.card.id,
+  );
   await assertFails(setDoc(ref, { ...r, base64: 'abc' }));
   await assertFails(
     setDoc(ref, {
@@ -61,7 +67,10 @@ it('rejects photo payloads, extra keys, oversized fields and wrong IDs', async (
 });
 it('requires monotonic revisions and retains recoverable tombstones', async () => {
   const r = record();
-  const ref = doc(env.authenticatedContext('owner').firestore(), 'users/owner/cards/' + r.card.id);
+  const ref = doc(
+    env.authenticatedContext(ownerUid).firestore(),
+    `users/${ownerUid}/cards/` + r.card.id,
+  );
   await assertSucceeds(setDoc(ref, r));
   await assertFails(updateDoc(ref, { rev: 1 }));
   await assertFails(updateDoc(ref, { rev: 3 }));
@@ -75,13 +84,16 @@ it('accepts Japanese fields and hash references only', async () => {
   r.card.fields.japaneseName = '大谷翔平';
   r.card.photos.front = 'a'.repeat(64);
   await assertSucceeds(
-    setDoc(doc(env.authenticatedContext('owner').firestore(), 'users/owner/cards/' + r.card.id), r),
+    setDoc(
+      doc(env.authenticatedContext(ownerUid).firestore(), `users/${ownerUid}/cards/` + r.card.id),
+      r,
+    ),
   );
 });
 it('expires authenticated signaling and permits only one answer', async () => {
-  const fs = env.authenticatedContext('owner').firestore();
+  const fs = env.authenticatedContext(ownerUid).firestore();
   const id = 'a'.repeat(32),
-    ref = doc(fs, 'users/owner/pairings/' + id);
+    ref = doc(fs, `users/${ownerUid}/pairings/` + id);
   await assertSucceeds(
     setDoc(ref, {
       offer: 'v=0',
@@ -89,11 +101,11 @@ it('expires authenticated signaling and permits only one answer', async () => {
       expiresAt: Timestamp.fromMillis(Date.now() + 300000),
     }),
   );
-  await assertFails(getDocs(collection(fs, 'users/owner/pairings')));
+  await assertFails(getDocs(collection(fs, `users/${ownerUid}/pairings`)));
   await assertSucceeds(updateDoc(ref, { answer: 'v=0 answer' }));
   await assertFails(updateDoc(ref, { answer: 'second' }));
   await assertFails(
-    getDoc(doc(env.authenticatedContext('other').firestore(), 'users/owner/pairings/' + id)),
+    getDoc(doc(env.authenticatedContext('other').firestore(), `users/${ownerUid}/pairings/` + id)),
   );
   await assertSucceeds(deleteDoc(ref));
   await assertFails(
@@ -104,7 +116,7 @@ it('expires authenticated signaling and permits only one answer', async () => {
     }),
   );
   await env.withSecurityRulesDisabled(async (c) => {
-    await setDoc(doc(c.firestore(), 'users/owner/pairings/' + id), {
+    await setDoc(doc(c.firestore(), `users/${ownerUid}/pairings/` + id), {
       offer: 'v=0',
       answer: null,
       expiresAt: Timestamp.fromMillis(Date.now() - 10000),
