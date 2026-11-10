@@ -8,11 +8,11 @@ The app has no card-count limit or subscription. Device storage and service quot
 
 ## License
 
-Copyright 2026 PoemofThanathos. The original Card Cabinet code, documentation and generated artwork are offered under the [PolyForm Strict License 1.0.0](LICENSE). It permits noncommercial use and does not grant permission to modify, create derivative works or redistribute the software. The full license controls these permissions.
+Copyright 2026 PoemofThanathos. The original Card Cabinet code, documentation and generated artwork are licensed under [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International](LICENSE), or CC BY-NC-ND 4.0. It allows noncommercial sharing with attribution and private adaptations, but does not permit sharing adapted material. The [full legal code](https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode.en) controls these permissions and includes the warranty disclaimer.
 
 Third-party libraries retain their own licenses. This project's license does not restrict rights granted by those libraries' licenses.
 
-Public GitHub repositories remain subject to [GitHub's platform permissions to view and fork them](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository). PolyForm Strict does not disable the Fork button or override those platform permissions.
+Public GitHub repositories remain subject to [GitHub's platform permissions to view and fork them](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository). CC BY-NC-ND 4.0 does not disable the Fork button or override those platform permissions.
 
 ## Start locally on Windows
 
