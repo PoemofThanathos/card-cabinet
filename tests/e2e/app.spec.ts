@@ -5,10 +5,13 @@ test('set grid, all-card list and player grid with persistent test cards', async
   page,
 }, testInfo) => {
   await page.goto('./');
+  await expect(page.getByRole('button', { name: 'Add test cards', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('button', { name: 'Add test cards', exact: true }).click();
   await expect(
     page.getByText('12 test cards added. Their artwork and card details are fictional.'),
   ).toBeVisible();
+  await page.getByRole('button', { name: /^Collection/ }).click();
   await expect(page.locator('.group-tile')).toHaveCount(6);
   await expect(page.locator('.group-cover img').first()).toBeVisible();
   await page.getByRole('button', { name: 'Dismiss notification' }).click();
@@ -178,6 +181,14 @@ test('project subpath, manifest, screenshots and no horizontal overflow', async 
   await page.reload();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await expect(page.getByLabel('Enable Identify on this device')).toBeChecked();
+  await expect(page.getByLabel('Unlimited attempts', { exact: true })).not.toBeChecked();
+  await page.getByLabel('Unlimited attempts', { exact: true }).check();
+  await expect(page.getByLabel('Daily attempt limit on this device')).toBeDisabled();
+  await page.reload();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByLabel('Unlimited attempts', { exact: true })).toBeChecked();
+  await page.getByLabel('Unlimited attempts', { exact: true }).uncheck();
+  await expect(page.getByLabel('Daily attempt limit on this device')).toBeEnabled();
   for (const screen of ['Settings', 'Backups & transfer']) {
     await page.getByRole('button', { name: screen, exact: true }).click();
     await expect(page.getByRole('heading', { name: screen, exact: true })).toBeVisible();

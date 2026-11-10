@@ -1,10 +1,10 @@
 # Card Cabinet
 
-[Open Card Cabinet](https://poemofthanathos.github.io/card-cabinet/). Choose **Add test cards** to try the app with 12 fictional cards. Each browser keeps its own collection.
+[Open Card Cabinet](https://poemofthanathos.github.io/card-cabinet/). Choose **Settings > Add test cards** to try the app with 12 fictional cards. Each browser keeps its own collection.
 
 A personal card collection app for iPhone Safari and Windows Edge or Chrome. Manual entry, photos, editing, search and backups work without an account. Firebase metadata sync and OpenAI identification are optional.
 
-The app has no card-count limit or subscription. Device storage and service quotas still apply. The published app has Firebase configured for its owner's account. OpenAI identification still requires configuration. No paid API requests were made during development.
+The app has no card-count limit or subscription. Device storage and service quotas still apply. Firebase is configured for its owner's account. The Cloudflare Worker is deployed with identification disabled pending API-key setup. No paid API requests were made during development.
 
 ## License
 
@@ -43,7 +43,7 @@ No Firebase configuration is needed for local use. `npm ci` downloads dependenci
 
 - Collection shows a grid of sets. Open a set to see its cards in a list. Sets with different years, makers or products stay separate. Cards without a set appear under No set.
 - All cards lists every active card across sets. Players groups cards by player or character name; open a player to see their cards across sets. Archive and Recently deleted remain separate views.
-- Add test cards creates 12 fictional cards in six sets, with front/back artwork and six players or characters. The cards are marked Test card and tagged `test-card`. They are saved locally and use the normal backup and metadata-sync flow. Adding them again never replaces edits or restores deleted examples. You can edit, archive or delete them like any card.
+- Settings > Add test cards creates 12 fictional cards in six sets, with front/back artwork and six players or characters. The cards are marked Test card and tagged `test-card`. They are saved locally and use the normal backup and metadata-sync flow. Adding them again never replaces edits or restores deleted examples. You can edit, archive or delete them like any card.
 - Add a card, import or capture each side, adjust rotation and crop, then choose Use photo. Save card commits the record to your collection. A local draft keeps unfinished edits across reloads.
 - Every physical copy has its own ID. Duplicate physical copy creates another ID and initially shares the same local photos. Retake them if the second copy differs. Nothing automatically merges matching cards.
 - Search includes Japanese text, notes and full-width numbers. Category, maker, year and missing-photo filters work in grid and list views.
@@ -55,6 +55,18 @@ No Firebase configuration is needed for local use. `npm ci` downloads dependenci
 The original camera file is not retained by this app. Use photo stores the edited JPEG, with a maximum edge of 2560 pixels and quality 0.92. Keep originals in Photos or Files if you want an archival source beyond the app's edited image. Canvas conversion removes EXIF, including GPS. Check small Japanese print before saving or identifying.
 
 HEIC support depends on the browser's decoder. If it fails, export a JPEG or use iPhone Camera > Formats > Most Compatible. A file-picker fallback is always available. Real camera, HEIC and orientation behavior still need the [iPhone checklist](docs/device-checklist.md).
+
+## Bulk entry and base sets
+
+Choose **Bulk add** to import photos, paste a manual card list, or add owned base cards by checklist number. There is no fixed photo-count limit. Browser memory, available storage and individual image limits still apply.
+
+Photo imports sort filenames naturally, then pair alternating front/back images or all fronts followed by all backs. Review the pairing and swap sides before saving. The app processes one pair at a time. Saved cards survive an interrupted import; reopen Bulk add and reselect the original files to continue.
+
+Manual lists accept one physical card per line, with name, card number, team and rarity separated by tabs or `|`. Shared set details apply to every row. No photos or AI are required.
+
+Base-set imports require the category, maker, year and set. Enter a checklist range, then choose a complete set, all except listed missing numbers, or only numbers you have confirmed owning. Unknown cards are not marked owned. Base cards are recorded with rarity `Base`; parallels, autographs, relics and serial-numbered cards do not count as matching base copies. Existing active or archived base copies are skipped on repeat import.
+
+Saved cards enter the normal backup and metadata-sync flow. Unfinished import plans stay on the current device and are not included in backups.
 
 ## Backups and moving photos
 
@@ -136,7 +148,9 @@ Each local edit queues a stable mutation ID and the remote revision it was based
 
 ## Optional OpenAI identification Worker
 
-The default app and Worker have identification off. OpenAI API billing is separate from ChatGPT. This app cannot read your balance, promise free credits or guarantee a spending cap. Do not enable it until you accept the possible API charges. No real photos were sent during development.
+Identification is off by default. Scans use your OpenAI API balance, including eligible subscription credits claimed by the linked API organization. The app cannot read that balance or guarantee a spending cap. [API credits guide](https://developers.openai.com/api/docs/guides/chatgpt-api-credits)
+
+The owner's Worker is deployed at `https://card-cabinet-identify.rousilon666.workers.dev`. It is configured for this app's Firebase owner and GitHub Pages origin, with `AI_ENABLED = "false"`. No OpenAI key has been installed and no live identification request has been made.
 
 Cloudflare documents a free Workers offering without a credit card requirement. SQLite Durable Objects are available on Workers Free. If onboarding asks you to upgrade or add a paid service, stop and keep manual entry enabled. Do not choose paid Workers, paid TURN, automatic top-ups or Firebase Blaze. [Workers](https://www.cloudflare.com/products/workers/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
 
@@ -157,9 +171,9 @@ The configured model is `gpt-6-luna`, verified on 9 November 2026 to accept imag
 
 Image copies are re-encoded as JPEG before transmission, with at most 2560 pixels per side and 2.5 MB per image. The Worker rejects URLs, unexpected fields, bad JPEG markers, out-of-range dimensions and EXIF segments. It verifies the Firebase token signature, issuer, audience, expiry, issue time and authentication time, then requires your configured UID. CORS is an additional restriction, not the authorization mechanism.
 
-A single Durable Object per UID reserves each attempt before the OpenAI request. It permits one in-flight request, at least 15 seconds between starts, 5 attempts per UTC day and 50 per UTC month. The reservation persists across Worker instances. Failed or ambiguous attempts still count. Replayed request IDs are refused during the current month. Storage or quota failures fail closed. The app never retries a paid request automatically.
+A single Durable Object per UID reserves each attempt before the OpenAI request. Capped mode allows 5 attempts per UTC day and 50 per UTC month across devices. **Settings > Unlimited attempts** removes the device's daily cap and asks the Worker to bypass its daily/monthly caps for that owner's scans. Attempts still count, so switching limits back on does not reset usage. Both modes keep one in-flight request, at least 15 seconds between starts, owner authentication and persistent replay protection. Storage or quota failures fail closed. The app never retries a paid request automatically.
 
-Select up to three collection cards for a batch. Confirm the number first, then identify and review one at a time. The batch checks the remaining device allowance and requires both photos for every selected card. Each next request still requires a click. Close the batch to stop. These controls are conservative guards, not an OpenAI billing guarantee.
+Select collection cards or finish a photo import, then start batch identification after reviewing its card count and photo-transmission notice. The batch sends cards sequentially without a fixed count cap. Capped mode checks the remaining device allowance first. Keep the app open while it runs. Pause stops after the current card; reopening the saved batch lets you continue the remainder. Failed or interrupted requests are not retried automatically. Suggestions remain local until you review and apply them, and are excluded from backups until applied.
 
 To stop scanning, disable Identify locally. To stop every device, set `AI_ENABLED` to `"false"` on the Worker and redeploy, or remove its OpenAI secret. Rotating or revoking a compromised key must happen in your OpenAI account. Token signature verification does not check Firebase revocation before token expiry; the server switch is the immediate stop mechanism.
 

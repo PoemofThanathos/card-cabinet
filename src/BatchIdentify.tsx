@@ -1,9 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
-import { type Card, type Suggestions, title, plainCard } from './model';
-import { db, saveCard, friendlyError, setting } from './db';
-import { identify } from './ai';
+import { useLiveQuery } from 'dexie-react-hooks';
+import { type Card, title } from './model';
+import { db, friendlyError, setting } from './db';
 import { Modal } from './components';
 import { SuggestionReview } from './Editor';
+import {
+  applyBatchReview,
+  batchKey,
+  createBatch,
+  reviewPrefix,
+  runBatch,
+  type BatchActivity,
+  type BatchReview,
+  type IdentificationBatch,
+} from './batch';
 
 export function BatchIdentify({
   cards,
@@ -14,137 +24,316 @@ export function BatchIdentify({
   onClose: () => void;
   onMessage: (s: string) => void;
 }) {
-  const [confirmed, setConfirmed] = useState(false),
-    [index, setIndex] = useState(0),
+  const batch = useLiveQuery(() => setting<IdentificationBatch | null>(batchKey, null), []);
+  const reviewCount =
+    useLiveQuery(() => db.settings.where('key').startsWith(reviewPrefix).count(), []) || 0;
+  const [page, setPage] = useState(0);
+  const reviews =
+    useLiveQuery(
+      () =>
+        db.settings
+          .where('key')
+          .startsWith(reviewPrefix)
+          .offset(page * 8)
+          .limit(8)
+          .toArray(),
+      [page],
+    ) || [];
+  const [savedView, setSavedView] = useState(cards.length === 0),
     [busy, setBusy] = useState(false),
-    [waiting, setWaiting] = useState(false),
+    [applying, setApplying] = useState(false),
     [error, setError] = useState(''),
-    [current, setCurrent] = useState<Card | null>(null),
-    [result, setResult] = useState<Suggestions | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(
-    () => () => {
-      if (timer.current) clearTimeout(timer.current);
-    },
-    [],
-  );
-  async function confirmBatch() {
+    [pausing, setPausing] = useState(false),
+    [activity, setActivity] = useState<BatchActivity>({ phase: 'idle' }),
+    [review, setReview] = useState<{ key: string; value: BatchReview } | null>(null),
+    [failurePage, setFailurePage] = useState(0);
+  const controller = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
+  const closeWhenPaused = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      controller.current?.abort();
+    };
+  }, []);
+  useEffect(() => {
+    if (page && page * 8 >= reviewCount) setPage(Math.max(0, Math.ceil(reviewCount / 8) - 1));
+  }, [page, reviewCount]);
+
+  async function start(replace: boolean) {
+    if (busy) return;
+    setBusy(true);
+    setPausing(false);
+    setError('');
+    controller.current = new AbortController();
     try {
-      const day = new Date().toISOString().slice(0, 10),
-        usage = await setting('aiUsage', { day, count: 0 }),
-        limit = await setting('aiLimit', 3);
-      if ((usage.day === day ? usage.count : 0) + cards.length > limit)
-        throw new Error(
-          "This batch exceeds this device's remaining daily attempt limit. Select fewer cards.",
+      const job = replace ? await createBatch(cards.map((card) => card.id)) : batch;
+      if (!job) throw new Error('No saved batch is available.');
+      setSavedView(true);
+      const finished = await runBatch(job.id, {
+        signal: controller.current.signal,
+        onActivity: (value) => {
+          if (mounted.current) setActivity(value);
+        },
+      });
+      if (mounted.current)
+        onMessage(
+          finished.status === 'complete'
+            ? 'Batch identification finished. Review the saved suggestions.'
+            : 'Batch paused. Progress and suggestions are saved here.',
         );
-      for (const card of cards)
-        for (const hash of Object.values(card.photos))
-          if (!hash || !(await db.photos.get(hash)))
-            throw new Error('Every selected card needs both photos on this device.');
-      setConfirmed(true);
     } catch (e) {
-      setError(friendlyError(e));
+      if (mounted.current) setError(friendlyError(e));
+    } finally {
+      if (mounted.current) {
+        setBusy(false);
+        setPausing(false);
+        setActivity({ phase: 'idle' });
+        if (closeWhenPaused.current) onClose();
+      }
     }
   }
-  async function scan() {
-    setBusy(true);
-    setError('');
-    try {
-      const local = await db.cards.get(cards[index].id);
-      if (!local) throw new Error('This card is no longer available.');
-      setCurrent(plainCard(local));
-      setWaiting(true);
-      timer.current = setTimeout(() => setWaiting(false), 15000);
-      setResult(await identify(plainCard(local)));
-    } catch (e) {
-      setError(
-        friendlyError(e) +
-          ' This batch is stopped. Close it to review your usage before another attempt.',
-      );
-      setConfirmed(false);
-    } finally {
-      setBusy(false);
-    }
+  function pause(close = false) {
+    closeWhenPaused.current = close;
+    setPausing(true);
+    controller.current?.abort();
+  }
+  function close() {
+    if (applying) return;
+    if (busy) pause(true);
+    else onClose();
   }
   async function apply(values: Partial<Card['fields']>) {
-    if (!current) return;
-    setBusy(true);
+    if (!review || applying) return;
+    setApplying(true);
+    setError('');
     try {
-      await saveCard({ ...current, fields: { ...current.fields, ...values } }, [], db, current);
-      setResult(null);
-      setIndex((n) => n + 1);
-      onMessage('Reviewed identification saved on this device.');
+      await applyBatchReview(review.key, values);
+      setReview(null);
+      onMessage('Reviewed fields saved on this device.');
     } catch (e) {
-      setResult(null);
+      setReview(null);
       setError(friendlyError(e));
     } finally {
-      setBusy(false);
+      setApplying(false);
     }
   }
+  async function discard(key: string) {
+    if (applying) return;
+    try {
+      await db.settings.delete(key);
+    } catch (e) {
+      setError(friendlyError(e));
+    }
+  }
+  const pending = batch
+    ? Math.max(0, batch.cardIds.length - batch.position - (batch.processing ? 1 : 0))
+    : 0;
   return (
-    <Modal
-      title="Identify selected cards"
-      onClose={() => {
-        if (!busy) onClose();
-      }}
-      wide
-    >
-      <p>
-        This batch contains {cards.length} physical {cards.length === 1 ? 'card' : 'cards'}. Each
-        card sends two photo copies to your Worker and OpenAI. OpenAI API use may be billed
-        separately from ChatGPT. Location metadata is removed from the copies.
-      </p>
-      <p className="notice">
-        Review one card at a time. Nothing is applied automatically. App and Worker counters do not
-        guarantee an OpenAI billing cap.
-      </p>
+    <Modal title="Batch identification" onClose={close} wide>
+      {!savedView && (
+        <>
+          <p>
+            This batch contains <strong>{cards.length}</strong> cards. Starting it sends both photos
+            of each card to your Worker and OpenAI, one card at a time, using your API balance.
+          </p>
+          <p>Keep this app open while it runs. Review the suggestions before applying fields.</p>
+          <ol>
+            {cards.slice(0, 8).map((card) => (
+              <li key={card.id}>
+                {title(card)}
+                {card.fields.cardNumber ? ' · #' + card.fields.cardNumber : ''}
+              </li>
+            ))}
+          </ol>
+          {cards.length > 8 && <p className="small muted">And {cards.length - 8} more cards.</p>}
+          {batch && (
+            <p className="notice">
+              A saved queue already exists. Starting this batch replaces its remaining queue. Saved
+              suggestions are kept.
+            </p>
+          )}
+          <div className="button-row">
+            <button
+              className="primary"
+              disabled={busy || batch === undefined}
+              onClick={() => void start(true)}
+            >
+              {batch ? 'Replace queue and start ' : 'Start identification of '}
+              {cards.length} cards
+            </button>
+            {batch && (
+              <button disabled={busy} onClick={() => setSavedView(true)}>
+                Open saved batch
+              </button>
+            )}
+          </div>
+        </>
+      )}
+      {savedView && batch && (
+        <>
+          <p role="status" aria-live="polite">
+            <strong>
+              {batch.position} / {batch.cardIds.length}
+            </strong>{' '}
+            processed. {batch.failures.length} failed or interrupted.
+          </p>
+          <progress
+            value={batch.position}
+            max={batch.cardIds.length}
+            aria-label="Batch identification progress"
+            style={{ width: '100%' }}
+          />
+          {busy ? (
+            <>
+              <p role="status">
+                {pausing
+                  ? 'Pausing after the current card finishes…'
+                  : activity.phase === 'waiting'
+                    ? 'Waiting before the next scan…'
+                    : 'Identifying the next card…'}
+              </p>
+              <button disabled={pausing} onClick={() => pause()}>
+                Pause batch
+              </button>
+            </>
+          ) : (
+            <>
+              {batch.processing && (
+                <p className="notice warning">
+                  A scan was in progress. If another tab is running, pause it there. After an
+                  interruption, its outcome is unknown and it may have used API credit. Continuing
+                  skips that card and waits for its server reservation to expire.
+                </p>
+              )}
+              {pending > 0 ? (
+                <>
+                  <p>
+                    Continue automatically with {pending} remaining cards. Each sends two photos and
+                    uses your API balance.
+                  </p>
+                  <button className="primary" onClick={() => void start(false)}>
+                    Continue {pending} remaining cards
+                  </button>
+                </>
+              ) : batch.processing ? (
+                <button onClick={() => void start(false)}>Mark interrupted scan and finish</button>
+              ) : (
+                <p>Queue finished. Saved suggestions are ready to review.</p>
+              )}
+            </>
+          )}
+          {batch.error && (
+            <p role="alert" className="notice warning">
+              {batch.error}
+            </p>
+          )}
+          {batch.failures.length > 0 && (
+            <details>
+              <summary>Failed or interrupted cards · {batch.failures.length}</summary>
+              <p className="small muted">
+                These cards stay in your collection. Open a card to retry it deliberately after
+                checking the error.
+              </p>
+              <ul>
+                {batch.failures
+                  .slice(failurePage * 8, failurePage * 8 + 8)
+                  .map((failure, index) => (
+                    <li key={failure.cardId + index}>
+                      <strong>{failure.name}</strong>
+                      <p>{failure.error}</p>
+                    </li>
+                  ))}
+              </ul>
+              {batch.failures.length > 8 && (
+                <div className="button-row">
+                  <button disabled={!failurePage} onClick={() => setFailurePage(failurePage - 1)}>
+                    Previous failures
+                  </button>
+                  <button
+                    disabled={(failurePage + 1) * 8 >= batch.failures.length}
+                    onClick={() => setFailurePage(failurePage + 1)}
+                  >
+                    Next failures
+                  </button>
+                </div>
+              )}
+            </details>
+          )}
+        </>
+      )}
+      {savedView && batch === null && (
+        <p>No saved batch. Select collection cards or add photos in bulk to start one.</p>
+      )}
       {error && (
         <p role="alert" className="notice warning">
           {error}
         </p>
       )}
-      <ol>
-        {cards.map((c, i) => (
-          <li key={c.id}>
-            {title(c)}
-            {i < index ? ' · reviewed' : ''}
-          </li>
-        ))}
-      </ol>
-      {index >= cards.length ? (
-        <p>All selected cards were reviewed.</p>
-      ) : !confirmed ? (
-        <button className="primary" onClick={() => void confirmBatch()}>
-          Confirm batch of {cards.length} {cards.length === 1 ? 'card' : 'cards'}
-        </button>
-      ) : (
-        <div className="button-row">
-          <button className="primary" disabled={busy || waiting} onClick={() => void scan()}>
-            {busy
-              ? 'Identifying…'
-              : waiting
-                ? 'Waiting between attempts…'
-                : 'Identify card ' + (index + 1) + ' of ' + cards.length}
-          </button>
-          <button disabled={busy} onClick={() => setIndex((n) => n + 1)}>
-            Skip this card
-          </button>
-        </div>
+      {reviewCount > 0 && (
+        <section>
+          <h3>Suggestions to review · {reviewCount}</h3>
+          <p className="small muted">
+            Progress and suggestions are saved only on this device. They are not included in card
+            backups until you apply the fields.
+          </p>
+          <ul>
+            {reviews.map((row) => {
+              const value = row.value as BatchReview;
+              return (
+                <li key={row.key}>
+                  <div className="button-row">
+                    <button disabled={applying} onClick={() => setReview({ key: row.key, value })}>
+                      Review {title(value.card)}
+                      {value.card.fields.cardNumber ? ' · #' + value.card.fields.cardNumber : ''}
+                    </button>
+                    <button
+                      disabled={applying}
+                      aria-label={
+                        'Discard suggestions for ' +
+                        title(value.card) +
+                        (value.card.fields.cardNumber ? ' #' + value.card.fields.cardNumber : '')
+                      }
+                      onClick={() => void discard(row.key)}
+                    >
+                      Discard
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+          {reviewCount > 8 && (
+            <div className="button-row">
+              <button disabled={!page} onClick={() => setPage(page - 1)}>
+                Previous suggestions
+              </button>
+              <span>
+                {page + 1} / {Math.ceil(reviewCount / 8)}
+              </span>
+              <button disabled={(page + 1) * 8 >= reviewCount} onClick={() => setPage(page + 1)}>
+                Next suggestions
+              </button>
+            </div>
+          )}
+        </section>
       )}
       <div className="modal-footer">
-        <button disabled={busy} onClick={onClose}>
-          Close batch
+        <button disabled={applying || pausing} onClick={close}>
+          {busy ? 'Pause and close' : 'Close batch'}
         </button>
       </div>
-      {result && current && (
+      {review && (
         <SuggestionReview
-          result={result}
-          card={current}
-          onClose={() => {
-            setResult(null);
-            setIndex((n) => n + 1);
-          }}
+          key={review.key}
+          card={review.value.card}
+          result={review.value.result}
+          closeLabel="Close review"
           onApply={(values) => void apply(values)}
+          onClose={() => {
+            if (!applying) setReview(null);
+          }}
         />
       )}
     </Modal>

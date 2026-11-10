@@ -9,10 +9,10 @@ enabled = false
 [vars]
 AI_ENABLED = "false"
 OPENAI_MODEL = "gpt-6-luna"
-FIREBASE_PROJECT_ID = "REPLACE_WITH_PROJECT_ID"
-OWNER_UID = "REPLACE_WITH_OWNER_UID"
+FIREBASE_PROJECT_ID = "card-cabinet-a1d92"
+OWNER_UID = "gBiqwPJN24XMSUDHIEejPBLyvKp2"
 # An origin has no project path. Example: https://yourname.github.io
-ALLOWED_ORIGIN = "https://REPLACE_WITH_USERNAME.github.io"
+ALLOWED_ORIGIN = "https://poemofthanathos.github.io"
 
 [[durable_objects.bindings]]
 name = "SCAN_GATE"

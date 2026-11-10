@@ -4,6 +4,7 @@ import { type User } from 'firebase/auth';
 import { Cloud, HardDrive, ScanLine, ExternalLink, ShieldCheck } from 'lucide-react';
 import { auth, firebaseConfigured, login, signOut } from './firebase';
 import { db, setting, setSetting, friendlyError } from './db';
+import { addSampleCards, sampleCardIds } from './samples';
 
 export function Settings({
   user,
@@ -23,21 +24,27 @@ export function Settings({
     [busy, setBusy] = useState(false),
     [storage, setStorage] = useState<StorageEstimate | null>(null),
     [persisted, setPersisted] = useState(false),
-    [aiEnabled, setAiEnabled] = useState<boolean | null>(null);
+    [aiEnabled, setAiEnabled] = useState<boolean | null>(null),
+    [aiUnlimited, setAiUnlimited] = useState<boolean | null>(null);
   const prefs = useLiveQuery(
     async () => ({
       owner: await setting('ownerUid', ''),
       ai: await setting('aiEnabled', false),
+      unlimited: await setting('aiUnlimited', false),
       limit: await setting('aiLimit', 3),
       usage: await setting('aiUsage', { day: '', count: 0 }),
       lastBackup: await setting('lastBackup', ''),
       lastSync: await setting('lastSync', ''),
+      samplesAdded: (await db.cards.bulkGet(sampleCardIds)).every(Boolean),
     }),
     [],
   );
   useEffect(() => {
     if (prefs?.ai === aiEnabled) setAiEnabled(null);
   }, [prefs?.ai, aiEnabled]);
+  useEffect(() => {
+    if (prefs?.unlimited === aiUnlimited) setAiUnlimited(null);
+  }, [prefs?.unlimited, aiUnlimited]);
   async function checkStorage() {
     try {
       setStorage((await navigator.storage?.estimate()) || null);
@@ -84,6 +91,7 @@ export function Settings({
     onMessage('This device is linked. Use Sync now to exchange metadata.');
   }
   const today = new Date().toISOString().slice(0, 10);
+  const unlimited = aiUnlimited ?? prefs?.unlimited ?? false;
   return (
     <>
       <div className="page-heading">
@@ -220,10 +228,36 @@ export function Settings({
             removes location metadata. Review the print before sending; compression can make small
             text harder to read.
           </p>
+          <label className="check-label">
+            <input
+              type="checkbox"
+              checked={unlimited}
+              disabled={!prefs}
+              aria-describedby="ai-unlimited-help"
+              onChange={(e) => {
+                const enabled = e.target.checked;
+                setAiUnlimited(enabled);
+                void setSetting('aiUnlimited', enabled)
+                  .then(() =>
+                    onMessage(enabled ? 'Unlimited attempts enabled.' : 'Attempt limits restored.'),
+                  )
+                  .catch((err) => {
+                    setAiUnlimited(null);
+                    onError(friendlyError(err));
+                  });
+              }}
+            />
+            Unlimited attempts
+          </label>
+          <p className="small muted" id="ai-unlimited-help">
+            Removes the daily and monthly scan caps for scans from this device. API usage still
+            consumes your balance. Provider limits and the 15-second wait between scans still apply.
+          </p>
           <label>
             Daily attempt limit on this device
             <select
               value={prefs?.limit || 3}
+              disabled={!prefs || unlimited}
               onChange={(e) => void setSetting('aiLimit', Number(e.target.value))}
             >
               {[1, 2, 3, 4, 5].map((n) => (
@@ -238,13 +272,14 @@ export function Settings({
             this device, in UTC.
           </p>
           <div className="notice warning">
-            OpenAI API use is billed separately from ChatGPT. Device counters and Worker limits do
-            not guarantee a billing cap. Failed requests may still be billed. The app cannot read
-            your balance.
+            Scans use your OpenAI API balance, including eligible linked subscription credits.
+            Failed requests may still be billed. The app cannot read your balance or guarantee a
+            spending cap.
           </div>
           <p className="small muted">
-            The Worker must also be enabled by its owner. It limits all devices together to 5
-            attempts per UTC day and 50 per UTC month. No OpenAI key belongs in this app.
+            The Worker must also be enabled by its owner. With Unlimited attempts off, it allows 5
+            attempts per UTC day and 50 per UTC month across devices, counting all attempts. No
+            OpenAI key belongs in this app.
           </p>
           <a
             href="https://platform.openai.com/settings/organization/billing/overview"
@@ -321,6 +356,26 @@ export function Settings({
             Updates wait for your choice. Finish editing and close other app tabs before applying
             one.
           </p>
+        </section>
+        <section className="panel">
+          <h2>Test cards</h2>
+          <p>Add 12 fictional cards with generated front and back photos.</p>
+          <button
+            disabled={busy || !prefs || prefs.samplesAdded}
+            onClick={() => {
+              setBusy(true);
+              void addSampleCards()
+                .then((count) =>
+                  onMessage(
+                    `${count} test cards added. Their artwork and card details are fictional.`,
+                  ),
+                )
+                .catch((e) => onError(friendlyError(e)))
+                .finally(() => setBusy(false));
+            }}
+          >
+            {prefs?.samplesAdded ? 'Test cards already added' : 'Add test cards'}
+          </button>
         </section>
       </div>
     </>

@@ -41,13 +41,13 @@ import { auth, onAuthStateChanged, cloudStore } from './firebase';
 import { syncCollection, resolveConflict } from './sync';
 import { Editor } from './Editor';
 import { BatchIdentify } from './BatchIdentify';
+import { BulkAdd } from './BulkAdd';
 import { Backups } from './Backups';
 import { Settings } from './Settings';
 import { Modal, PhotoView } from './components';
 import { exportPackage, download } from './backup';
 import { groupCards, groupKey } from './groups';
 import { GroupGrid } from './GroupGrid';
-import { addSampleCards, sampleCardIds } from './samples';
 
 function CardStatus({
   card,
@@ -83,6 +83,7 @@ export default function App() {
     conflicts = useLiveQuery(() => db.conflicts.toArray(), []) || [],
     queue = useLiveQuery(() => db.queue.count(), []) || 0;
   const draft = useLiveQuery(() => setting<Draft | null>('draft', null), []);
+  const savedBatch = useLiveQuery(() => setting<unknown>('aiBatch', null), []);
   const hashes = new Set(photos),
     conflictIds = new Set(conflicts.map((c) => c.id));
   const [page, setPage] = useState<'collection' | 'all' | 'players' | 'backups' | 'settings'>(
@@ -108,6 +109,7 @@ export default function App() {
     [online, setOnline] = useState(navigator.onLine),
     [conflictOpen, setConflictOpen] = useState(false),
     [selectedIds, setSelectedIds] = useState<string[]>([]),
+    [bulkOpen, setBulkOpen] = useState(false),
     [batch, setBatch] = useState<Card[] | null>(null);
   const {
     offlineReady: [offlineReady, setOfflineReady],
@@ -219,8 +221,7 @@ export default function App() {
   const groups = groupCards(filtered, groupKind, sort);
   const showingGroups = grouped && !openGroup;
   const listView = status === 'active' ? 'list' : view;
-  const testCardsAdded = sampleCardIds.every((id) => cards.some((card) => card.id === id));
-  const allBusy = busy || backupBusy || syncing || !!editor || !!batch;
+  const allBusy = busy || backupBusy || syncing || !!editor || !!batch || bulkOpen;
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -418,21 +419,9 @@ export default function App() {
                   )}
                 </div>
                 <div className="button-row heading-actions">
-                  {!testCardsAdded && (
-                    <button
-                      disabled={allBusy}
-                      onClick={() =>
-                        void run(async () => {
-                          const count = await addSampleCards();
-                          setNotice(
-                            `${count} test cards added. Their artwork and card details are fictional.`,
-                          );
-                        })
-                      }
-                    >
-                      Add test cards
-                    </button>
-                  )}
+                  <button disabled={allBusy} onClick={() => setBulkOpen(true)}>
+                    Bulk add
+                  </button>
                   <button className="primary add-button" onClick={openNew}>
                     <Plus size={19} />
                     Add a card
@@ -471,6 +460,12 @@ export default function App() {
                   >
                     Discard
                   </button>
+                </div>
+              )}
+              {!!savedBatch && (
+                <div className="draft-bar">
+                  <span>Identification batch saved on this device.</span>
+                  <button onClick={() => setBatch([])}>Open identification batch</button>
                 </div>
               )}
               <div className="collection-toolbar">
@@ -531,15 +526,23 @@ export default function App() {
                 )}
               </div>
               <div className="filter-line">
-                {selectedIds.length > 0 && (
-                  <button
-                    className="secondary"
-                    onClick={() =>
-                      setBatch(cards.filter((c) => selectedIds.includes(c.id)).map(plainCard))
-                    }
-                  >
-                    Identify selected · {selectedIds.length}
+                {!showingGroups && filtered.length > 0 && (
+                  <button onClick={() => setSelectedIds(filtered.map((c) => c.id))}>
+                    Select all shown
                   </button>
+                )}
+                {selectedIds.length > 0 && (
+                  <>
+                    <button
+                      className="secondary"
+                      onClick={() =>
+                        setBatch(cards.filter((c) => selectedIds.includes(c.id)).map(plainCard))
+                      }
+                    >
+                      Identify selected · {selectedIds.length}
+                    </button>
+                    <button onClick={() => setSelectedIds([])}>Clear selection</button>
+                  </>
                 )}
                 <span>
                   {showingGroups &&
@@ -613,7 +616,6 @@ export default function App() {
                             type="checkbox"
                             aria-label={'Select ' + title(c) + ' for identification'}
                             checked={selectedIds.includes(c.id)}
-                            disabled={!selectedIds.includes(c.id) && selectedIds.length >= 3}
                             onChange={(e) =>
                               setSelectedIds((ids) =>
                                 e.target.checked ? [...ids, c.id] : ids.filter((id) => id !== c.id),
@@ -692,6 +694,20 @@ export default function App() {
           )}
         </main>
       </div>
+      {bulkOpen && (
+        <BulkAdd
+          onClose={() => setBulkOpen(false)}
+          onSaved={(ids, identify) => {
+            setBulkOpen(false);
+            setNotice(`${ids.length} cards saved on this device.`);
+            if (identify)
+              void run(async () => {
+                const saved = await db.cards.bulkGet(ids);
+                setBatch(saved.filter((c): c is LocalCard => !!c).map(plainCard));
+              });
+          }}
+        />
+      )}
       {batch && (
         <BatchIdentify
           cards={batch}

@@ -14,7 +14,7 @@ export async function identify(card: Card) {
   const usage = await setting('aiUsage', { day, count: 0 });
   const count = usage.day === day ? usage.count : 0;
   const limit = Math.min(5, Math.max(1, await setting('aiLimit', 3)));
-  if (count >= limit)
+  if (!(await setting('aiUnlimited', false)) && count >= limit)
     throw new Error('This device reached its daily scan limit. This is not an OpenAI billing cap.');
   const front = card.photos.front ? await db.photos.get(card.photos.front) : null;
   const back = card.photos.back ? await db.photos.get(card.photos.back) : null;
@@ -28,19 +28,36 @@ export async function identify(card: Card) {
   ]);
   const token = await auth.currentUser.getIdToken();
   // Reserve before sending, including failed/ambiguous requests. Do not retry paid calls.
-  await db.transaction('rw', db.settings, async () => {
-    const current = await setting('aiUsage', { day, count: 0 });
-    const n = current.day === day ? current.count : 0;
-    if (n >= limit) throw new Error('This device reached its daily scan limit.');
-    await db.settings.put({ key: 'aiUsage', value: { day, count: n + 1 } });
+  const unlimited = await db.transaction('rw', db.settings, async () => {
+    if (!(await setting('aiEnabled', false)))
+      throw new Error('Enable identification in Settings first.');
+    const requestDay = new Date().toISOString().slice(0, 10);
+    const current = await setting('aiUsage', { day: requestDay, count: 0 });
+    const n = current.day === requestDay ? current.count : 0;
+    const currentLimit = Math.min(5, Math.max(1, await setting('aiLimit', 3)));
+    const uncapped = await setting('aiUnlimited', false);
+    if (!uncapped && n >= currentLimit)
+      throw new Error('This device reached its daily scan limit.');
+    await db.settings.put({ key: 'aiUsage', value: { day: requestDay, count: n + 1 } });
+    return uncapped;
   });
   const response = await fetch(url.replace(/\/$/, '') + '/identify', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-    body: JSON.stringify({ requestId: crypto.randomUUID(), images }),
+    body: JSON.stringify({ requestId: crypto.randomUUID(), images, unlimited }),
     signal: AbortSignal.timeout(60000),
   });
-  const result = await response.json();
+  let result: unknown;
+  try {
+    result = await response.json();
+  } catch {
+    throw new Error(
+      (response.ok
+        ? 'Identification returned an unreadable response.'
+        : `Identification failed with HTTP ${response.status}.`) +
+        ' The attempt may have been billed. No automatic retry was sent.',
+    );
+  }
   if (!response.ok) {
     const error = (result as { error?: unknown })?.error;
     throw new Error(

@@ -1,0 +1,118 @@
+.bulk-add label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 14px 0;
+}
+.bulk-add input,
+.bulk-add select,
+.bulk-add textarea {
+  width: 100%;
+  min-width: 0;
+}
+.bulk-add textarea {
+  resize: vertical;
+}
+.bulk-common {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  margin: 20px 0;
+  padding: 12px 16px;
+}
+.bulk-common legend {
+  font-weight: 600;
+  padding: 0 6px;
+}
+.bulk-common .form-grid label {
+  margin: 8px 0;
+}
+.bulk-file-input input {
+  padding: 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+}
+.bulk-photo-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.bulk-photo-pair figure {
+  margin: 0;
+  min-width: 0;
+}
+.bulk-photo-pair img,
+.bulk-photo-placeholder {
+  width: 100%;
+  height: 250px;
+  object-fit: contain;
+  background: #edf0e8;
+  border-radius: 8px;
+}
+.bulk-photo-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.bulk-photo-pair figcaption {
+  display: grid;
+  gap: 3px;
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.bulk-review-list {
+  display: grid;
+  gap: 10px;
+}
+.bulk-review-card {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 13px;
+}
+.bulk-review-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+.bulk-review-title span {
+  color: var(--muted);
+  text-transform: capitalize;
+}
+.bulk-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 18px;
+}
+.bulk-pagination span {
+  font-size: 12px;
+  text-align: center;
+}
+.bulk-add .modal-footer {
+  flex-wrap: wrap;
+}
+@media (max-width: 540px) {
+  .bulk-common {
+    padding: 10px;
+  }
+  .bulk-common .form-grid {
+    grid-template-columns: 1fr;
+  }
+  .bulk-photo-pair {
+    gap: 8px;
+  }
+  .bulk-photo-pair img,
+  .bulk-photo-placeholder {
+    height: 170px;
+  }
+  .bulk-add .button-row {
+    flex-wrap: wrap;
+  }
+  .bulk-add .modal-footer button {
+    flex: 1 1 100%;
+  }
+}

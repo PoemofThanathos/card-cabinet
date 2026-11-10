@@ -11,6 +11,7 @@ import worker, {
   type Env,
 } from '../worker/index';
 import { readFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 let privateKey: CryptoKey, keys: JWTVerifyGetKey;
 const env = {
   FIREBASE_PROJECT_ID: 'test-project',
@@ -26,7 +27,58 @@ beforeAll(async () => {
   const jwk = await exportJWK(pair.publicKey);
   keys = createLocalJWKSet({ keys: [{ ...jwk, kid: 'test', alg: 'RS256', use: 'sig' }] });
 });
-afterEach(() => vi.unstubAllGlobals());
+const sqlDatabases: DatabaseSync[] = [];
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  for (const database of sqlDatabases.splice(0)) database.close();
+});
+function durableContext() {
+  const database = new DatabaseSync(':memory:');
+  sqlDatabases.push(database);
+  let saved: ReturnType<typeof reserve>['state'] | undefined;
+  let lock = Promise.resolve();
+  const storage = {
+    get: vi.fn(async () => structuredClone(saved)),
+    put: vi.fn(async (_key: string, value: ReturnType<typeof reserve>['state']) => {
+      saved = structuredClone(value);
+    }),
+    sql: {
+      exec(query: string, ...bindings: string[]) {
+        const rows = database.prepare(query).all(...bindings);
+        return { toArray: () => rows };
+      },
+    },
+  };
+  const ctx = {
+    storage,
+    blockConcurrencyWhile: (fn: () => Promise<unknown>) => {
+      const next = lock.then(fn);
+      lock = next.then(
+        () => {},
+        () => {},
+      );
+      return next;
+    },
+  } as unknown as DurableObjectState;
+  return { ctx, storage, saved: () => saved };
+}
+function scanRequest(requestId = crypto.randomUUID(), unlimited?: boolean) {
+  return new Request('https://internal/identify', {
+    method: 'POST',
+    body: JSON.stringify({ requestId, images: [jpeg(), jpeg()], unlimited }),
+  });
+}
+const completedResponse = () =>
+  Response.json({
+    status: 'completed',
+    output: [
+      {
+        type: 'message',
+        content: [{ type: 'output_text', text: '{"suggestions":[],"warnings":[]}' }],
+      },
+    ],
+  });
 async function token(changes: Record<string, unknown> = {}) {
   const now = Math.floor(Date.now() / 1000);
   return new SignJWT({
@@ -88,6 +140,14 @@ describe('Worker request boundaries', () => {
     ).toThrow();
     expect(() => validateScan({ requestId: crypto.randomUUID(), images: [jpeg()] })).toThrow();
   });
+  it('accepts explicit unlimited mode and rejects non-boolean overrides', () => {
+    const scan = { requestId: crypto.randomUUID(), images: [jpeg(), jpeg()] };
+    expect(validateScan(scan).unlimited).toBeUndefined();
+    expect(validateScan({ ...scan, unlimited: true }).unlimited).toBe(true);
+    expect(validateScan({ ...scan, unlimited: false }).unlimited).toBe(false);
+    for (const unlimited of ['true', 1, null, {}])
+      expect(() => validateScan({ ...scan, unlimited })).toThrow();
+  });
   it('rejects EXIF metadata and oversized dimensions', () => {
     const bytes = readFileSync(new URL('./fixtures/card.jpg', import.meta.url));
     const exif = Buffer.concat([
@@ -128,14 +188,13 @@ describe('Worker request boundaries', () => {
   });
 });
 describe('durable usage limits', () => {
-  it('enforces one in-flight scan, replay prevention, spacing and daily limits', () => {
+  it('enforces one in-flight scan, spacing and daily limits', () => {
     const now = Date.UTC(2026, 10, 9);
     const id = crypto.randomUUID();
     let result = reserve(undefined, id, now);
     expect(result.state.daily).toBe(1);
     expect(reserve(result.state, crypto.randomUUID(), now + 20000).error).toContain('running');
     result.state.lease = null;
-    expect(reserve(result.state, id, now + 20000).error).toContain('already');
     expect(reserve(result.state, crypto.randomUUID(), now + 1000).error).toContain('15 seconds');
     for (let n = 1; n < 5; n++) {
       result = reserve({ ...result.state, lease: null }, crypto.randomUUID(), now + n * 20000);
@@ -143,6 +202,22 @@ describe('durable usage limits', () => {
     }
     expect(
       reserve({ ...result.state, lease: null }, crypto.randomUUID(), now + 200000).error,
+    ).toContain('limit');
+  });
+  it('unlimited mode bypasses count caps while retaining counts, spacing and the lease', () => {
+    const now = Date.UTC(2026, 10, 10);
+    const previous = reserve(undefined, crypto.randomUUID(), now).state;
+    previous.daily = 5;
+    previous.monthly = 50;
+    expect(reserve(previous, crypto.randomUUID(), now + 20000, true).error).toContain('running');
+    previous.lease = null;
+    expect(reserve(previous, crypto.randomUUID(), now + 1000, true).error).toContain('15 seconds');
+    const result = reserve(previous, crypto.randomUUID(), now + 20000, true);
+    expect(result.error).toBeUndefined();
+    expect(result.state.daily).toBe(6);
+    expect(result.state.monthly).toBe(51);
+    expect(
+      reserve({ ...result.state, lease: null }, crypto.randomUUID(), now + 40000).error,
     ).toContain('limit');
   });
   it('keeps monthly limits across daily resets and resets on a new UTC month', () => {
@@ -176,22 +251,7 @@ describe('durable usage limits', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
   it('serializes reservations for concurrent requests and counts failed calls', async () => {
-    let saved: unknown;
-    let lock = Promise.resolve();
-    const storage = {
-      get: async () => structuredClone(saved),
-      put: async (_k: string, v: unknown) => {
-        saved = structuredClone(v);
-      },
-    };
-    const ctx = {
-      storage,
-      blockConcurrencyWhile: (fn: () => Promise<unknown>) => {
-        const next = lock.then(fn);
-        lock = next.then(() => {});
-        return next;
-      },
-    } as unknown as DurableObjectState;
+    const { ctx, saved } = durableContext();
     let release!: () => void;
     const wait = new Promise<void>((r) => (release = r));
     const fetcher = vi.fn(async () => {
@@ -200,18 +260,79 @@ describe('durable usage limits', () => {
     });
     vi.stubGlobal('fetch', fetcher);
     const gate = new ScanGate(ctx, env);
-    const req = () =>
-      new Request('https://internal', {
-        method: 'POST',
-        body: JSON.stringify({ requestId: crypto.randomUUID(), images: [jpeg(), jpeg()] }),
-      });
-    const first = gate.fetch(req());
+    const first = gate.fetch(scanRequest(crypto.randomUUID(), true));
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
-    expect((await gate.fetch(req())).status).toBe(429);
+    expect((await gate.fetch(scanRequest(crypto.randomUUID(), true))).status).toBe(429);
     release();
     expect((await first).status).toBe(502);
-    expect((saved as { daily: number }).daily).toBe(1);
+    expect(saved()?.daily).toBe(1);
   });
+  it('persists replay protection beyond 50 unlimited attempts and across object recreation', async () => {
+    const { ctx, saved, storage } = durableContext();
+    let now = Date.UTC(2026, 10, 10);
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetcher = vi.fn(async () => completedResponse());
+    vi.stubGlobal('fetch', fetcher);
+    const firstId = crypto.randomUUID();
+    for (let i = 0; i < 55; i++) {
+      const gate = new ScanGate(ctx, env);
+      expect(
+        (await gate.fetch(scanRequest(i === 0 ? firstId : crypto.randomUUID(), true))).status,
+      ).toBe(200);
+      now += 20000;
+    }
+    expect(saved()?.monthly).toBe(55);
+    expect(storage.sql.exec('SELECT id FROM scan_requests').toArray()).toHaveLength(55);
+    const restored = new ScanGate(ctx, env);
+    const replay = await restored.fetch(scanRequest(firstId, true));
+    expect(replay.status).toBe(429);
+    expect(((await replay.json()) as { error: string }).error).toContain('already');
+    expect((await restored.fetch(scanRequest())).status).toBe(429);
+    expect((await restored.fetch(scanRequest(crypto.randomUUID(), false))).status).toBe(429);
+    expect(fetcher).toHaveBeenCalledTimes(55);
+  });
+  it('retains failed request IDs without retrying their provider calls', async () => {
+    const { ctx } = durableContext();
+    const fetcher = vi.fn(async () => new Response('{}', { status: 500 }));
+    vi.stubGlobal('fetch', fetcher);
+    const id = crypto.randomUUID();
+    expect((await new ScanGate(ctx, env).fetch(scanRequest(id, true))).status).toBe(502);
+    expect((await new ScanGate(ctx, env).fetch(scanRequest(id, true))).status).toBe(429);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it('clears replay rows at the next UTC month and resets the capped allowance', async () => {
+    const { ctx, storage, saved } = durableContext();
+    let now = Date.UTC(2026, 10, 30, 12);
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => completedResponse()),
+    );
+    expect(
+      (await new ScanGate(ctx, env).fetch(scanRequest(crypto.randomUUID(), true))).status,
+    ).toBe(200);
+    now = Date.UTC(2026, 11, 1);
+    expect((await new ScanGate(ctx, env).fetch(scanRequest())).status).toBe(200);
+    expect(storage.sql.exec('SELECT id FROM scan_requests').toArray()).toHaveLength(1);
+    expect(saved()?.monthly).toBe(1);
+  });
+  it.each(['sql', 'counter'])(
+    'never calls the provider when %s persistence fails',
+    async (failure) => {
+      const { ctx, storage } = durableContext();
+      const fetcher = vi.fn();
+      vi.stubGlobal('fetch', fetcher);
+      if (failure === 'sql')
+        vi.spyOn(storage.sql, 'exec').mockImplementation(() => {
+          throw new Error('Storage failed');
+        });
+      else storage.put.mockRejectedValue(new Error('Storage failed'));
+      await expect(
+        new ScanGate(ctx, env).fetch(scanRequest(crypto.randomUUID(), true)),
+      ).rejects.toThrow('Storage failed');
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
 });
 describe('mocked OpenAI structured outputs', () => {
   it('uses the server model, both images, strict schema and no storage', async () => {

@@ -45,6 +45,7 @@ const requestSchema = z
   .object({
     requestId: z.uuid(),
     images: z.tuple([z.string().max(3400000), z.string().max(3400000)]),
+    unlimited: z.boolean().optional(),
   })
   .strict();
 export type ScanRequest = z.infer<typeof requestSchema>;
@@ -195,19 +196,19 @@ type GateState = {
   lease: string | null;
   leaseUntil: number;
   lastStart: number;
-  requests: string[];
 };
 export function reserve(
   previous: GateState | undefined,
   requestId: string,
   now: number,
+  unlimited = false,
 ): { state: GateState; error?: string } {
   const iso = new Date(now).toISOString(),
     day = iso.slice(0, 10),
     month = iso.slice(0, 7);
   const state: GateState = previous
-    ? { ...previous, requests: [...previous.requests] }
-    : { day, month, daily: 0, monthly: 0, lease: null, leaseUntil: 0, lastStart: 0, requests: [] };
+    ? { ...previous }
+    : { day, month, daily: 0, monthly: 0, lease: null, leaseUntil: 0, lastStart: 0 };
   if (state.day !== day) {
     state.day = day;
     state.daily = 0;
@@ -215,15 +216,12 @@ export function reserve(
   if (state.month !== month) {
     state.month = month;
     state.monthly = 0;
-    state.requests = [];
   }
-  if (state.requests.includes(requestId))
-    return { state, error: 'This request was already attempted. It will not be sent twice.' };
   if (state.lease && state.leaseUntil > now)
     return { state, error: 'Another scan is still running.' };
   if (state.lastStart && now - state.lastStart < 15000)
     return { state, error: 'Wait at least 15 seconds between scans.' };
-  if (state.daily >= 5 || state.monthly >= 50)
+  if (!unlimited && (state.daily >= 5 || state.monthly >= 50))
     return {
       state,
       error: 'Worker scan limit reached. Maximum 5 attempts per UTC day and 50 per UTC month.',
@@ -233,7 +231,6 @@ export function reserve(
   state.lastStart = now;
   state.lease = requestId;
   state.leaseUntil = now + 120000;
-  state.requests.push(requestId);
   return { state };
 }
 const outputSchema = {
@@ -342,12 +339,18 @@ export class ScanGate {
       return json({ error: 'Identification is disabled.' }, 503);
     const scan = requestSchema.parse(await request.json());
     const error = await this.ctx.blockConcurrencyWhile(async () => {
-      const result = reserve(
-        await this.ctx.storage.get<GateState>('limits'),
-        scan.requestId,
-        Date.now(),
-      );
+      const now = Date.now();
+      const previous = await this.ctx.storage.get<GateState>('limits');
+      const sql = this.ctx.storage.sql;
+      // Separate rows keep replay protection from outgrowing a single KV value in unlimited mode.
+      sql.exec('CREATE TABLE IF NOT EXISTS scan_requests (id TEXT PRIMARY KEY)');
+      if (previous?.month !== new Date(now).toISOString().slice(0, 7))
+        sql.exec('DELETE FROM scan_requests');
+      if (sql.exec('SELECT id FROM scan_requests WHERE id = ?', scan.requestId).toArray().length)
+        return 'This request was already attempted. It will not be sent twice.';
+      const result = reserve(previous, scan.requestId, now, scan.unlimited);
       if (result.error) return result.error;
+      sql.exec('INSERT INTO scan_requests (id) VALUES (?)', scan.requestId);
       await this.ctx.storage.put('limits', result.state);
       return undefined;
     });

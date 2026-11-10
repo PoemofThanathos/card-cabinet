@@ -18,11 +18,13 @@ export function SuggestionReview({
   card,
   onApply,
   onClose,
+  closeLabel = 'Discard suggestions',
 }: {
   result: Suggestions;
   card: Card;
   onApply: (values: Partial<Card['fields']>) => void;
   onClose: () => void;
+  closeLabel?: string;
 }) {
   const [checked, setChecked] = useState<string[]>([]);
   function apply() {
@@ -86,7 +88,7 @@ export function SuggestionReview({
         is not a calibrated probability.
       </p>
       <div className="modal-footer">
-        <button onClick={onClose}>Discard suggestions</button>
+        <button onClick={onClose}>{closeLabel}</button>
         <button className="primary" disabled={!checked.length} onClick={apply}>
           <Check size={17} />
           Apply selected fields
