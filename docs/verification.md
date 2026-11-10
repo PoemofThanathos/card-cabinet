@@ -50,9 +50,11 @@ Firebase is configured on the no-cost Spark plan for project `card-cabinet-a1d92
 
 The GitHub Actions variables include the public Firebase configuration and owner UID.
 
+On 10 November 2026, the owner signed in to the published app and confirmed linking the local collection. Sync now completed successfully against Firestore. All 12 fictional cards showed Synced, and the pending metadata count fell from 12 to zero. After a page reload, the collection still contained 12 cards and 24 local photos, with zero pending metadata changes. Photos were not uploaded.
+
 ## Not verified by these checks
 
-A live signed-in sync still needs the owner to sign in, link the local collection and choose Sync now. Emulator tests cannot establish account-specific quota behavior.
+Live sync between two physical devices and account-specific quota behavior remain unverified.
 
 No Worker was deployed, and no real OpenAI identification was requested. Worker setup, quota behavior and CPU headroom still need the owner's setup and approval. The Worker dry run and mocked calls cannot establish production behavior.
 
