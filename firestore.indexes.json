@@ -1,0 +1,4 @@
+{
+  "indexes": [],
+  "fieldOverrides": [{ "collectionGroup": "cards", "fieldPath": "card", "indexes": [] }]
+}

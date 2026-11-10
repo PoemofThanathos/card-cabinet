@@ -1,0 +1,23 @@
+name = "card-cabinet-identify"
+main = "index.ts"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[observability]
+enabled = false
+
+[vars]
+AI_ENABLED = "false"
+OPENAI_MODEL = "gpt-6-luna"
+FIREBASE_PROJECT_ID = "REPLACE_WITH_PROJECT_ID"
+OWNER_UID = "REPLACE_WITH_OWNER_UID"
+# An origin has no project path. Example: https://yourname.github.io
+ALLOWED_ORIGIN = "https://REPLACE_WITH_USERNAME.github.io"
+
+[[durable_objects.bindings]]
+name = "SCAN_GATE"
+class_name = "ScanGate"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ScanGate"]

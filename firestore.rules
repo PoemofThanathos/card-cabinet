@@ -1,0 +1,72 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Replace this exact placeholder with the one personal Firebase Authentication UID.
+    function owner(uid) { return request.auth != null && request.auth.uid == uid && uid == 'REPLACE_WITH_OWNER_UID'; }
+    function uuid(s) { return s is string && s.matches('^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'); }
+    function hash(s) { return s == null || (s is string && s.matches('^[a-f0-9]{64}$')); }
+    function fieldsValid(f) {
+      return f is map && f.keys().hasAll(["category","product","name","japaneseName","romanization","team","maker","set","year","cardNumber","language","rarity","serial","autograph","memorabilia","notes","tags","location","purchaseDate","purchasePrice","purchaseCurrency","purchaseSource"]) && f.keys().hasOnly(["category","product","name","japaneseName","romanization","team","maker","set","year","cardNumber","language","rarity","serial","autograph","memorabilia","notes","tags","location","purchaseDate","purchasePrice","purchaseCurrency","purchaseSource"])
+        && f.category is string && f.category.size() <= 300
+        && f.product is string && f.product.size() <= 300
+        && f.name is string && f.name.size() <= 300
+        && f.japaneseName is string && f.japaneseName.size() <= 300
+        && f.romanization is string && f.romanization.size() <= 300
+        && f.team is string && f.team.size() <= 300
+        && f.maker is string && f.maker.size() <= 300
+        && f.set is string && f.set.size() <= 300
+        && f.year is string && f.year.size() <= 300
+        && f.cardNumber is string && f.cardNumber.size() <= 300
+        && f.language is string && f.language.size() <= 300
+        && f.rarity is string && f.rarity.size() <= 300
+        && f.serial is string && f.serial.size() <= 300
+        && f.autograph is string && f.autograph.size() <= 300
+        && f.memorabilia is string && f.memorabilia.size() <= 300
+        && f.notes is string && f.notes.size() <= 4000
+        && f.tags is string && f.tags.size() <= 300
+        && f.location is string && f.location.size() <= 300
+        && f.purchaseDate is string && f.purchaseDate.size() <= 300
+        && f.purchasePrice is string && f.purchasePrice.size() <= 300
+        && f.purchaseCurrency is string && f.purchaseCurrency.size() <= 300
+        && f.purchaseSource is string && f.purchaseSource.size() <= 300;
+    }
+    function cardValid(c, id) {
+      return c is map && c.keys().hasAll(['id','fields','photos','status','createdAt','updatedAt'])
+        && c.keys().hasOnly(['id','fields','photos','status','createdAt','updatedAt'])
+        && uuid(c.id) && c.id == id && fieldsValid(c.fields)
+        && c.status in ['active','archived','deleted']
+        && c.createdAt is string && c.createdAt.size() <= 30 && c.updatedAt is string && c.updatedAt.size() <= 30
+        && c.photos is map && c.photos.keys().hasAll(['front','back']) && c.photos.keys().hasOnly(['front','back'])
+        && hash(c.photos.front) && hash(c.photos.back);
+    }
+    function recordValid(r, id) {
+      return r.keys().hasAll(['rev','mutationId','card']) && r.keys().hasOnly(['rev','mutationId','card'])
+        && r.rev is int && r.rev > 0 && uuid(r.mutationId) && cardValid(r.card,id);
+    }
+    match /users/{uid}/cards/{id} {
+      allow read: if owner(uid);
+      allow create: if owner(uid) && recordValid(request.resource.data,id) && request.resource.data.rev == 1;
+      allow update: if owner(uid) && recordValid(request.resource.data,id) && request.resource.data.rev == resource.data.rev + 1;
+      allow delete: if false; // Keep tombstones so an offline device cannot resurrect a deleted record.
+    }
+    match /users/{uid}/pairings/{id} {
+      function valid(r) {
+        return id.matches('^[a-f0-9]{32}$') && r.keys().hasAll(['offer','answer','expiresAt'])
+          && r.keys().hasOnly(['offer','answer','expiresAt'])
+          && r.offer is string && r.offer.size() <= 30000
+          && (r.answer == null || (r.answer is string && r.answer.size() <= 30000))
+          && r.expiresAt is timestamp;
+      }
+      allow get: if owner(uid) && resource.data.expiresAt > request.time;
+      allow list: if false;
+      allow create: if owner(uid) && valid(request.resource.data) && request.resource.data.answer == null
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(10, 'm');
+      allow update: if owner(uid) && valid(request.resource.data) && resource.data.expiresAt > request.time
+        && resource.data.answer == null && request.resource.data.answer is string
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['answer']);
+      allow delete: if owner(uid);
+    }
+  }
+}
+
