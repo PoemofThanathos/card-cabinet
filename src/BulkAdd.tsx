@@ -8,6 +8,7 @@ import { SpeedControl, useProcessingSpeed } from './SpeedControl';
 import {
   consumePhotoMatchingPairs,
   getPhotoMatchingJob,
+  localMatchingFiles,
   type PhotoMatchingJob,
 } from './photo-matching';
 import {
@@ -71,8 +72,25 @@ export function BulkAdd({
   useEffect(() => {
     active.current = true;
     void Promise.all([getBulkEntryPlan(), getPhotoMatchingJob()])
-      .then(([saved, matching]) => {
+      .then(async ([saved, matching]) => {
+        const pendingSources: FileReference[] = [];
+        const pendingPhotos: Record<string, string> = {};
+        for (const entry of saved?.entries ?? []) {
+          if (entry.state !== 'pending' || !entry.sources) continue;
+          entry.sources.forEach((source, index) => {
+            const hash = entry.card.photos[index ? 'back' : 'front'];
+            if (hash) {
+              pendingSources.push(source);
+              pendingPhotos[fileKey(source)] = hash;
+            }
+          });
+        }
+        const restored = [
+          ...(await localMatchingFiles({ files: pendingSources, localPhotos: pendingPhotos })),
+          ...(matching?.localPhotos ? await localMatchingFiles(matching) : []),
+        ];
         if (!active.current) return;
+        setFiles([...new Map(restored.map((file) => [fileKey(file), file])).values()]);
         if (saved) {
           setPlan(saved);
           setPersisted(true);
@@ -80,8 +98,12 @@ export function BulkAdd({
         }
         setHasAiDraft(Boolean(matching));
       })
-      .catch((e) => setError(friendlyError(e)))
-      .finally(() => setLoading(false));
+      .catch((e) => {
+        if (active.current) setError(friendlyError(e));
+      })
+      .finally(() => {
+        if (active.current) setLoading(false);
+      });
     return () => {
       active.current = false;
       paused.current = true;
@@ -270,11 +292,14 @@ export function BulkAdd({
       identifyAfterSaving: true,
       entries: [
         ...retained,
-        ...pairs.map((sources) => ({
-          card: bulkCard(plan?.entries[0]?.card.fields ?? common, {}),
-          sources,
-          state: 'pending' as const,
-        })),
+        ...pairs.map((sources) => {
+          const card = bulkCard(plan?.entries[0]?.card.fields ?? common, {});
+          sources.forEach((source, index) => {
+            const hash = job.localPhotos?.[fileKey(source)];
+            if (hash && /^[a-f0-9]{64}$/.test(hash)) card.photos[index ? 'back' : 'front'] = hash;
+          });
+          return { card, sources, state: 'pending' as const };
+        }),
       ],
     };
     await withBulkEntryTransaction(async () => {

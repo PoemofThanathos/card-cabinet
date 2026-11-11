@@ -12,7 +12,7 @@ import {
   type IdentificationBatch,
 } from './batch';
 import { fileKey, type FileReference } from './bulk-entry';
-import { db, type CabinetDB, friendlyError, setting, setSetting } from './db';
+import { db, type CabinetDB, friendlyError, photoBlob, photoHash, setting, setSetting } from './db';
 import {
   photoAnalysisResultSchema,
   type PhotoAnalysis,
@@ -40,6 +40,7 @@ export type PhotoMatchingJob = {
   speed?: ProcessingSpeed;
   nextCursor?: number;
   inFlight?: PhotoMatchingRequest[];
+  localPhotos?: Record<string, string>;
 };
 export type PhotoMatchingActivity = {
   phase: 'analyzing' | 'waiting' | 'paused' | 'complete';
@@ -64,6 +65,49 @@ export type PhotoMatchingOptions = {
 
 export function getPhotoMatchingJob(database = db) {
   return setting<PhotoMatchingJob | null>(photoMatchingKey, null, database);
+}
+
+export async function localMatchingFiles(
+  job: Pick<PhotoMatchingJob, 'files' | 'localPhotos'>,
+  database = db,
+): Promise<File[]> {
+  const files: File[] = [];
+  if (!job.localPhotos) return files;
+  const loaded = new Set<string>();
+  for (const source of job.files) {
+    if (
+      typeof source.name !== 'string' ||
+      !source.name.trim() ||
+      /[\\/\0]/.test(source.name) ||
+      !Number.isSafeInteger(source.size) ||
+      source.size <= 0 ||
+      !Number.isSafeInteger(source.lastModified) ||
+      source.lastModified < 0
+    )
+      continue;
+    const key = fileKey(source);
+    const hash = job.localPhotos[key];
+    if (loaded.has(key) || typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash)) continue;
+    const photo = await database.photos.get(hash);
+    if (
+      !photo ||
+      photo.hash !== hash ||
+      !(photo.bytes instanceof ArrayBuffer) ||
+      photo.type !== 'image/jpeg' ||
+      photo.size !== source.size ||
+      photo.bytes.byteLength !== source.size
+    )
+      continue;
+    if ((await photoHash(photoBlob(photo))) !== hash) continue;
+    const file = new File([photo.bytes], source.name, {
+      type: photo.type,
+      lastModified: source.lastModified,
+    });
+    if (fileKey(file) !== key) continue;
+    files.push(file);
+    loaded.add(key);
+  }
+  return files;
 }
 
 function normalizeJob(saved: PhotoMatchingJob): PhotoMatchingJob & {
@@ -465,6 +509,15 @@ export async function consumePhotoMatchingPairs(
       ...job,
       files: remaining,
       results,
+      ...(job.localPhotos
+        ? {
+            localPhotos: Object.fromEntries(
+              remaining
+                .map((source) => [fileKey(source), job.localPhotos![fileKey(source)]])
+                .filter(([, hash]) => typeof hash === 'string'),
+            ),
+          }
+        : {}),
       cursor: remaining.length,
       nextCursor: remaining.length,
       inFlight: [],

@@ -194,6 +194,12 @@ export function AiPhotoMatch({
       <p className="small muted">
         {options && identificationLabel(job?.identificationOptions ?? options)}
       </p>
+      {job?.localPhotos && Object.keys(job.localPhotos).length > 0 && (
+        <p className="small muted">
+          Draft photos are stored on this device. They are not included in card backups until saved
+          as cards.
+        </p>
+      )}
       {job?.status !== 'complete' && (
         <SpeedControl value={speed} onChange={setSpeed} disabled={busy || !speedReady} ai />
       )}

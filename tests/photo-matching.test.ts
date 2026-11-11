@@ -1,9 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Dexie from 'dexie';
-import { CabinetDB, setting, setSetting } from '../src/db';
+import { CabinetDB, makePhoto, purgeDeletedCards, saveCard, setting, setSetting } from '../src/db';
 import { aiLeaseMs, type IdentificationOptions } from '../src/ai-options';
 import { type ProcessingSpeed } from '../src/processing-speed';
-import { fileKey, fileReference, type FileReference } from '../src/bulk-entry';
+import {
+  bulkCard,
+  changeBulkEntry,
+  fileKey,
+  fileReference,
+  getBulkEntryPlan,
+  saveBulkEntries,
+  storeBulkEntryPlan,
+  withBulkEntryTransaction,
+  type BulkEntryPlan,
+  type FileReference,
+} from '../src/bulk-entry';
 import { type PhotoAnalysis, type PhotoAnalysisResult } from '../src/photo-analysis';
 import {
   consumePhotoMatchingPairs,
@@ -12,6 +23,7 @@ import {
   deletePhotoMatchingJob,
   derivePhotoMatches,
   getPhotoMatchingJob,
+  localMatchingFiles,
   photoMatchingKey,
   photoMatchingLastAttemptKey,
   runPhotoMatchingJob,
@@ -745,5 +757,136 @@ describe('accepting reviewed pairs', () => {
     await expect(
       consumePhotoMatchingPairs(job.id, [[job.files[0], job.files[1]]], database),
     ).rejects.toThrow('Finish photo analysis');
+  });
+});
+
+describe('local photos in matching drafts', () => {
+  async function storedJob(count = 3) {
+    const files = Array.from(
+      { length: count },
+      (_, index) =>
+        new File(['local-photo-' + index], 'カード-' + index + '.jpg', {
+          type: 'image/jpeg',
+          lastModified: 1234,
+        }),
+    );
+    const photos = await Promise.all(files.map(makePhoto));
+    await database.photos.bulkPut(photos);
+    const job = described(
+      files.map((_, index) => analysis(index === 0 ? 'front' : index === 1 ? 'back' : 'unknown')),
+    );
+    const outcomes = Object.values(job.results);
+    job.files = files.map(fileReference);
+    job.results = Object.fromEntries(files.map((file, index) => [fileKey(file), outcomes[index]]));
+    job.localPhotos = Object.fromEntries(
+      files.map((file, index) => [fileKey(file), photos[index].hash]),
+    );
+    return { files, photos, job };
+  }
+
+  it('reconstructs exact File keys and bytes without creating cards or sending requests', async () => {
+    const { files, job } = await storedJob();
+    const outbound = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('No request is expected'));
+    const restored = await localMatchingFiles(job, database);
+    expect(restored.map(fileKey)).toEqual(files.map(fileKey));
+    expect(await Promise.all(restored.map((file) => file.text()))).toEqual(
+      await Promise.all(files.map((file) => file.text())),
+    );
+    expect(restored.every((file) => file.type === 'image/jpeg')).toBe(true);
+    expect(await database.cards.count()).toBe(0);
+    expect(await database.queue.count()).toBe(0);
+    expect(outbound).not.toHaveBeenCalled();
+  });
+
+  it('keeps missing files reselectable without discarding other stored previews', async () => {
+    const { files, photos, job } = await storedJob();
+    await database.photos.delete(photos[1].hash);
+    await setSetting(photoMatchingKey, job, database);
+    expect((await localMatchingFiles(job, database)).map(fileKey)).toEqual([
+      fileKey(files[0]),
+      fileKey(files[2]),
+    ]);
+    expect(await getPhotoMatchingJob(database)).toEqual(job);
+  });
+
+  it.each(['hash', 'name', 'size', 'bytes', 'date', 'type'] as const)(
+    'skips invalid stored %s data',
+    async (invalid) => {
+      const { photos, job } = await storedJob(1);
+      const ref = { ...job.files[0] };
+      if (invalid === 'name') ref.name = '../other.jpg';
+      if (invalid === 'size') ref.size++;
+      if (invalid === 'date') ref.lastModified = 1.5;
+      job.files = [ref];
+      job.localPhotos = { [fileKey(ref)]: invalid === 'hash' ? 'invalid-hash' : photos[0].hash };
+      if (invalid === 'bytes') {
+        const corrupted = photos[0].bytes.slice(0);
+        new Uint8Array(corrupted)[0] ^= 1;
+        await database.photos.put({ ...photos[0], bytes: corrupted });
+      }
+      if (invalid === 'type') await database.photos.put({ ...photos[0], type: 'text/html' });
+      expect(await localMatchingFiles(job, database)).toEqual([]);
+    },
+  );
+
+  it('hands accepted hashes to pending cards and retains unmatched photos through purge, swap and save', async () => {
+    const { files, photos, job } = await storedJob();
+    await setSetting(photoMatchingKey, job, database);
+    const card = bulkCard({}, { name: 'Reviewed card' });
+    card.photos = { front: photos[0].hash, back: photos[1].hash };
+    const plan: BulkEntryPlan = {
+      id: crypto.randomUUID(),
+      kind: 'photos',
+      identifyAfterSaving: true,
+      entries: [{ card, state: 'pending', sources: [job.files[0], job.files[1]] }],
+    };
+    await withBulkEntryTransaction(async () => {
+      await storeBulkEntryPlan(plan, database);
+      await consumePhotoMatchingPairs(job.id, [plan.entries[0].sources!], database);
+    }, database);
+    const remaining = (await getPhotoMatchingJob(database))!;
+    expect(remaining.files).toEqual([job.files[2]]);
+    expect(remaining.localPhotos).toEqual({ [fileKey(files[2])]: photos[2].hash });
+    const deleted = bulkCard({}, {});
+    deleted.status = 'deleted';
+    deleted.photos = { front: photos[0].hash, back: photos[2].hash };
+    await saveCard(deleted, [], database);
+    await purgeDeletedCards([deleted.id], database);
+    expect(await database.photos.count()).toBe(3);
+
+    const swapped = await changeBulkEntry(plan.id, 0, 'swap', database);
+    const entry = swapped.entries[0];
+    expect(entry.card.photos).toEqual({ front: photos[1].hash, back: photos[0].hash });
+    const restored = await localMatchingFiles(
+      {
+        files: entry.sources!,
+        localPhotos: {
+          [fileKey(entry.sources![0])]: entry.card.photos.front!,
+          [fileKey(entry.sources![1])]: entry.card.photos.back!,
+        },
+      },
+      database,
+    );
+    expect(restored.map(fileKey)).toEqual([fileKey(files[1]), fileKey(files[0])]);
+    const encode = vi.fn(async () => {
+      throw new Error('Stored JPEGs should not be recompressed.');
+    });
+    const saved = await saveBulkEntries(
+      swapped,
+      new Map(restored.map((file) => [fileKey(file), file])),
+      { database, speed: 'normal', encode },
+    );
+    expect(saved.entries[0].state).toBe('saved');
+    expect(encode).not.toHaveBeenCalled();
+    expect((await database.cards.get(card.id))?.photos).toEqual(entry.card.photos);
+    expect((await getBulkEntryPlan(database))?.entries[0].state).toBe('saved');
+    expect(
+      (await localMatchingFiles((await getPhotoMatchingJob(database))!, database)).map(fileKey),
+    ).toEqual([fileKey(files[2])]);
+    expect(
+      (await database.cards.toArray()).filter((value) => value.status === 'active'),
+    ).toHaveLength(1);
   });
 });

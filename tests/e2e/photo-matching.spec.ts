@@ -1,6 +1,133 @@
 import { test, expect } from '@playwright/test';
-import { copyFileSync } from 'node:fs';
+import { copyFileSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
+
+test('stored matching photos reopen without reselection and remain drafts until paired and saved', async ({
+  page,
+}, testInfo) => {
+  let requests = 0;
+  page.on('request', (request) => {
+    if (request.url().endsWith('/identify')) requests++;
+  });
+  await page.goto('./');
+  await expect(page.getByRole('heading', { name: 'Your collection', exact: true })).toBeVisible();
+  const bytes = readFileSync(path.resolve('tests/fixtures/card.jpg'));
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  await page.evaluate(
+    async ({ bytes, hash }) => {
+      const files = ['front.jpg', 'back.jpg', 'unmatched.jpg'].map((name) => ({
+        name,
+        size: bytes.length,
+        lastModified: 1234,
+      }));
+      const key = (source: (typeof files)[number]) =>
+        JSON.stringify([source.name, source.size, source.lastModified]);
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('card-cabinet');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      await new Promise<void>((resolve, reject) => {
+        const tx = database.transaction(['settings', 'photos'], 'readwrite');
+        tx.objectStore('photos').put({
+          hash,
+          bytes: new Uint8Array(bytes).buffer,
+          size: bytes.length,
+          type: 'image/jpeg',
+        });
+        tx.objectStore('settings').put({
+          key: 'aiPhotoMatching',
+          value: {
+            version: 1,
+            id: 'local-matching-draft',
+            files,
+            identificationOptions: { model: 'gpt-6-luna', reasoningEffort: 'low' },
+            cursor: files.length,
+            nextCursor: files.length,
+            inFlight: [],
+            processing: null,
+            status: 'complete',
+            lastAttemptAt: 0,
+            notBefore: 0,
+            error: '',
+            localPhotos: Object.fromEntries(files.map((source) => [key(source), hash])),
+            results: Object.fromEntries(
+              files.map((source, index) => [
+                key(source),
+                {
+                  analysis: {
+                    side: index === 0 ? 'front' : index === 1 ? 'back' : 'unknown',
+                    name: index < 2 ? 'Printed player' : '',
+                    maker: 'Printed maker',
+                    set: '',
+                    year: '',
+                    cardNumber: '',
+                    variant: '',
+                    serial: '',
+                    evidence: 'Printed details.',
+                    warnings: [],
+                  },
+                },
+              ]),
+            ),
+          },
+        });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+      database.close();
+    },
+    { bytes: [...bytes], hash },
+  );
+  await page.reload();
+  await page.getByRole('button', { name: 'Bulk add', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Bulk add', exact: true });
+  await dialog.getByRole('button', { name: 'Resume AI photo matching', exact: true }).click();
+  await expect(
+    dialog.getByRole('heading', { name: '1 proposed pair · 1 unmatched photo', exact: true }),
+  ).toBeVisible();
+  await expect(dialog.getByAltText('Selected front photo', { exact: true })).toBeVisible();
+  await expect(dialog.getByAltText('Selected back photo', { exact: true })).toBeVisible();
+  await expect(
+    dialog.getByText(
+      'Draft photos are stored on this device. They are not included in card backups until saved as cards.',
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(dialog.getByText('Reselect photo', { exact: true })).toHaveCount(0);
+  expect(requests).toBe(0);
+  await page.screenshot({ path: testInfo.outputPath('local-matching-draft.png'), fullPage: true });
+  await dialog.getByRole('button', { name: 'Use 1 pair', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Close and resume later', exact: true }).click();
+  await page.getByRole('button', { name: /^All cards/ }).click();
+  await expect(page.locator('.collection-card')).toHaveCount(0);
+
+  await page.reload();
+  await page.getByRole('button', { name: 'Bulk add', exact: true }).click();
+  await expect(dialog.getByAltText('Selected front photo', { exact: true })).toBeVisible();
+  await expect(dialog.getByAltText('Selected back photo', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('Reselect photo', { exact: true })).toHaveCount(0);
+  await dialog.getByRole('button', { name: 'Save and identify 1 cards', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Batch identification', exact: true }),
+  ).toBeVisible();
+  expect(requests).toBe(0);
+  await page.getByRole('button', { name: 'Close batch', exact: true }).click();
+  await page.getByRole('button', { name: /^All cards/ }).click();
+  await expect(page.locator('.collection-card')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Bulk add', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Resume AI photo matching', exact: true }).click();
+  await expect(
+    dialog.getByRole('heading', { name: '0 proposed pairs · 1 unmatched photo', exact: true }),
+  ).toBeVisible();
+  await expect(dialog.getByAltText('Unmatched photo', { exact: true })).toBeVisible();
+  await expect(
+    dialog.locator('figcaption').getByText('unmatched.jpg', { exact: true }),
+  ).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(requests).toBe(0);
+});
 
 test('AI photo matching reviews shuffled pairs, keeps unmatched photos and opens identification after saving', async ({
   page,

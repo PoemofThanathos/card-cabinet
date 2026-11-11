@@ -260,7 +260,10 @@ export async function changeBulkEntry(
       await database.settings.put({ key: entryKey(planId, index), value: entry });
     if (entry.state !== 'pending') return (await getBulkEntryPlan(database))!;
     if (action === 'skip') entry.state = 'skipped';
-    else if (entry.sources) entry.sources = [entry.sources[1], entry.sources[0]];
+    else if (entry.sources) {
+      entry.sources = [entry.sources[1], entry.sources[0]];
+      entry.card.photos = { front: entry.card.photos.back, back: entry.card.photos.front };
+    }
     await database.settings.put({ key: entryKey(planId, index), value: entry });
     return (await getBulkEntryPlan(database))!;
   }, database);
@@ -279,11 +282,13 @@ async function prepareEntry(
   const card = structuredClone(expected.card);
   const photos: Photo[] = [];
   if (expected.sources) {
-    for (const source of expected.sources) {
+    for (const [side, source] of expected.sources.entries()) {
       const file = files.get(fileKey(source));
       if (!file)
         throw new Error(`Reselect the original photos to continue. Missing file: ${source.name}`);
-      photos.push(await encode(file));
+      const savedHash = expected.card.photos[side ? 'back' : 'front'];
+      const local = savedHash && file.type === 'image/jpeg' ? await makePhoto(file) : null;
+      photos.push(local?.hash === savedHash ? local! : await encode(file));
     }
     card.photos = { front: photos[0].hash, back: photos[1].hash };
   }

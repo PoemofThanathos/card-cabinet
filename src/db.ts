@@ -139,6 +139,10 @@ function collectPhotoReferences(value: unknown, hashes: Set<string>) {
     if (photos && typeof photos === 'object')
       for (const hash of [photos.front, photos.back])
         if (typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)) hashes.add(hash);
+    const localPhotos = object.localPhotos;
+    if (localPhotos && typeof localPhotos === 'object' && !Array.isArray(localPhotos))
+      for (const hash of Object.values(localPhotos))
+        if (typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)) hashes.add(hash);
     for (const child of Object.values(object)) pending.push(child);
   }
 }
