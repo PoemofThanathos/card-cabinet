@@ -11,10 +11,11 @@ Updated 11 November 2026. Automated tests use generated fixtures, fake credentia
 - Versioned ZIP backups, SHA-256 verification, restore, reviewed merge, repeated-import safety and CSV export.
 - Firebase email/password integration, a persistent operation queue, revision transactions and conflict/deletion review.
 - Owner-only Firestore rules with field validation, revision checks and authenticated, expiring pairing records.
-- A protected Worker with Firebase token verification, image/request validation, a server model, a server off switch and SQLite Durable Object limits.
+- A protected Worker with Firebase token verification, image/request validation, allowed model choices, a server off switch and SQLite Durable Object limits.
 - Bulk entry from photo pairs, pasted manual lists and base-set number ranges. Photo pairing supports alternating front/back files or all fronts followed by all backs, with review, swap and skip controls. There is no photo-count cap. Each card and its import progress save together, so a partial import can resume without repeating completed entries.
 - Base-set entry records only ownership confirmed by the user, using a complete set, a list of missing numbers or a list of owned numbers. It does not infer player names, parallels, autographs or memorabilia. Repeating a base-set import skips already recorded base numbers while preserving existing physical copies and variants.
 - Explicit single-card identification and confirmed sequential batches, with saved progress and suggestions, pause/resume, cross-tab locking and review before applying fields. Interrupted or failed requests are not retried automatically. A changed card keeps its current values and saved suggestions for review.
+- Settings offer GPT-6 Luna, GPT-6.1 Terra, GPT-6.1 Sol and GPT-6 Astra, each with Low, Medium and High reasoning. Choices persist locally and appear before sending. Batches and saved reviews retain their selected options; legacy batches use Luna Low.
 - An optional Unlimited attempts setting removes the device and Worker daily/monthly scan-count caps for requests from that device. Usage counting, the identification off switches, one-request concurrency, request replay protection, the 15-second spacing and provider limits still apply. The setting does not guarantee an OpenAI spending limit.
 - WebRTC transfer proof of concept with bounded chunks, backpressure, integrity checks and ZIP fallback.
 - Project-subpath PWA configuration, install icons, offline shell, deferred updates and a GitHub Pages workflow.
@@ -22,7 +23,7 @@ Updated 11 November 2026. Automated tests use generated fixtures, fake credentia
 
 ## Automated checks
 
-The 10 November source revision passed **89 unit/integration tests, all 16 browser checks across Chromium and WebKit, and the TypeScript/Vite build**. These formal test counts are unchanged by the 11 November credential setup and live checks. The build and browser tests use the `/card-cabinet/` project subpath. Mobile screenshots were reviewed. Browser tests use isolated local collections and mocked identification results.
+The 11 November model-selector revision passed **117 unit/integration tests, all 18 browser checks across Chromium and WebKit, and the TypeScript/Vite build**. The build and browser tests use the `/card-cabinet/` project subpath. Mobile screenshots were reviewed. Browser tests use isolated local collections and mocked identification results. All twelve model/reasoning combinations are covered by mocked Worker requests. Persistence, request snapshots, legacy batches, invalid options and interruption timing are also covered.
 
 The earlier collection-view revision passed 50 unit/integration tests and 8 Chromium/WebKit browser tests. The earlier implementation also passed 5 Firestore emulator tests, a fresh `npm ci` and a Wrangler deployment dry run. Firestore rules and dependencies are unchanged by the credential setup. The Worker is now active, as recorded below.
 
@@ -63,7 +64,7 @@ On 10 November 2026, the owner signed in to the published app and confirmed link
 
 On 11 November 2026, a key for the Card Storage OpenAI project was created through encrypted connector delivery. The authorized local copy is in the ignored `worker/.dev.vars` file; the deployed copy is a Worker secret. The key is excluded from frontend code, GitHub, backups and screenshots. An authenticated Responses API request asking `gpt-6-luna` for a haiku succeeded. This confirms API access, not the remaining account balance.
 
-The Worker is active on Workers Free at [card-cabinet-identify.rousilon666.workers.dev](https://card-cabinet-identify.rousilon666.workers.dev), with `AI_ENABLED=true`. The deployed version is `96c69f33-44c0-4b55-beb2-36fad3c5db8e`.
+The Worker is active on Workers Free at [card-cabinet-identify.rousilon666.workers.dev](https://card-cabinet-identify.rousilon666.workers.dev), with `AI_ENABLED=true`. The model-selector version is `f546dccf-5203-4f73-a33c-0dab1b2f1b30`.
 
 Live HTTP checks returned:
 

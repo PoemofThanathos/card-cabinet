@@ -5,6 +5,15 @@ import { Cloud, HardDrive, ScanLine, ExternalLink, ShieldCheck } from 'lucide-re
 import { auth, firebaseConfigured, login, signOut } from './firebase';
 import { db, setting, setSetting, friendlyError } from './db';
 import { addSampleCards, sampleCardIds } from './samples';
+import {
+  aiModels,
+  reasoningEfforts,
+  modelLabels,
+  reasoningLabels,
+  type IdentificationOptions,
+  defaultIdentificationOptions,
+  normalizeIdentificationOptions,
+} from './ai-options';
 
 export function Settings({
   user,
@@ -25,12 +34,17 @@ export function Settings({
     [storage, setStorage] = useState<StorageEstimate | null>(null),
     [persisted, setPersisted] = useState(false),
     [aiEnabled, setAiEnabled] = useState<boolean | null>(null),
-    [aiUnlimited, setAiUnlimited] = useState<boolean | null>(null);
+    [aiUnlimited, setAiUnlimited] = useState<boolean | null>(null),
+    [aiOptions, setAiOptions] = useState<IdentificationOptions | null>(null),
+    [optionsBusy, setOptionsBusy] = useState(false);
   const prefs = useLiveQuery(
     async () => ({
       owner: await setting('ownerUid', ''),
       ai: await setting('aiEnabled', false),
       unlimited: await setting('aiUnlimited', false),
+      options: normalizeIdentificationOptions(
+        await setting('aiOptions', defaultIdentificationOptions),
+      ),
       limit: await setting('aiLimit', 3),
       usage: await setting('aiUsage', { day: '', count: 0 }),
       lastBackup: await setting('lastBackup', ''),
@@ -45,6 +59,35 @@ export function Settings({
   useEffect(() => {
     if (prefs?.unlimited === aiUnlimited) setAiUnlimited(null);
   }, [prefs?.unlimited, aiUnlimited]);
+  useEffect(() => {
+    if (
+      aiOptions &&
+      prefs?.options.model === aiOptions.model &&
+      prefs.options.reasoningEffort === aiOptions.reasoningEffort
+    )
+      setAiOptions(null);
+  }, [prefs?.options.model, prefs?.options.reasoningEffort, aiOptions]);
+  async function updateOptions(change: Partial<IdentificationOptions>) {
+    setOptionsBusy(true);
+    setAiOptions({ ...(aiOptions ?? prefs?.options ?? defaultIdentificationOptions), ...change });
+    try {
+      const saved = await db.transaction('rw', db.settings, async () => {
+        const current = normalizeIdentificationOptions(
+          await setting('aiOptions', defaultIdentificationOptions),
+        );
+        const next = { ...current, ...change };
+        await setSetting('aiOptions', next);
+        return next;
+      });
+      setAiOptions(saved);
+      onMessage('Identification options saved.');
+    } catch (e) {
+      setAiOptions(null);
+      onError(friendlyError(e));
+    } finally {
+      setOptionsBusy(false);
+    }
+  }
   async function checkStorage() {
     try {
       setStorage((await navigator.storage?.estimate()) || null);
@@ -92,6 +135,7 @@ export function Settings({
   }
   const today = new Date().toISOString().slice(0, 10);
   const unlimited = aiUnlimited ?? prefs?.unlimited ?? false;
+  const options = aiOptions ?? prefs?.options ?? defaultIdentificationOptions;
   return (
     <>
       <div className="page-heading">
@@ -227,6 +271,46 @@ export function Settings({
             Identify sends copies of both selected photos to your Worker and OpenAI. Canvas encoding
             removes location metadata. Review the print before sending; compression can make small
             text harder to read.
+          </p>
+          <label>
+            Model
+            <select
+              aria-label="Identification model"
+              value={options.model}
+              disabled={!prefs || optionsBusy}
+              onChange={(e) =>
+                void updateOptions({ model: e.target.value as IdentificationOptions['model'] })
+              }
+            >
+              {aiModels.map((model) => (
+                <option key={model} value={model}>
+                  {modelLabels[model]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Reasoning effort
+            <select
+              aria-label="Reasoning effort"
+              value={options.reasoningEffort}
+              disabled={!prefs || optionsBusy}
+              onChange={(e) =>
+                void updateOptions({
+                  reasoningEffort: e.target.value as IdentificationOptions['reasoningEffort'],
+                })
+              }
+            >
+              {reasoningEfforts.map((effort) => (
+                <option key={effort} value={effort}>
+                  {reasoningLabels[effort]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="small muted">
+            Applies to new requests. Saved batches keep their selected model and reasoning. More
+            reasoning can take longer and use more tokens.
           </p>
           <label className="check-label">
             <input

@@ -4,6 +4,8 @@ import { type Card, title } from './model';
 import { db, friendlyError, setting } from './db';
 import { Modal } from './components';
 import { SuggestionReview } from './Editor';
+import { readIdentificationOptions } from './ai';
+import { identificationLabel, normalizeIdentificationOptions } from './ai-options';
 import {
   applyBatchReview,
   batchKey,
@@ -25,6 +27,7 @@ export function BatchIdentify({
   onMessage: (s: string) => void;
 }) {
   const batch = useLiveQuery(() => setting<IdentificationBatch | null>(batchKey, null), []);
+  const chosenOptions = useLiveQuery(() => readIdentificationOptions(), []);
   const reviewCount =
     useLiveQuery(() => db.settings.where('key').startsWith(reviewPrefix).count(), []) || 0;
   const [page, setPage] = useState(0);
@@ -68,7 +71,13 @@ export function BatchIdentify({
     setError('');
     controller.current = new AbortController();
     try {
-      const job = replace ? await createBatch(cards.map((card) => card.id)) : batch;
+      if (replace && !chosenOptions) throw new Error('Identification settings are still loading.');
+      const job = replace
+        ? await createBatch(
+            cards.map((card) => card.id),
+            { identificationOptions: chosenOptions },
+          )
+        : batch;
       if (!job) throw new Error('No saved batch is available.');
       setSavedView(true);
       const finished = await runBatch(job.id, {
@@ -139,6 +148,12 @@ export function BatchIdentify({
             of each card to your Worker and OpenAI, one card at a time, using your API balance.
           </p>
           <p>Keep this app open while it runs. Review the suggestions before applying fields.</p>
+          {chosenOptions && (
+            <p className="small muted">
+              {identificationLabel(chosenOptions)}. This choice stays with the batch when you pause
+              or change Settings.
+            </p>
+          )}
           <ol>
             {cards.slice(0, 8).map((card) => (
               <li key={card.id}>
@@ -157,7 +172,7 @@ export function BatchIdentify({
           <div className="button-row">
             <button
               className="primary"
-              disabled={busy || batch === undefined}
+              disabled={busy || batch === undefined || !chosenOptions}
               onClick={() => void start(true)}
             >
               {batch ? 'Replace queue and start ' : 'Start identification of '}
@@ -173,6 +188,9 @@ export function BatchIdentify({
       )}
       {savedView && batch && (
         <>
+          <p className="small muted">
+            {identificationLabel(normalizeIdentificationOptions(batch.identificationOptions))}
+          </p>
           <p role="status" aria-live="polite">
             <strong>
               {batch.position} / {batch.cardIds.length}
@@ -329,6 +347,7 @@ export function BatchIdentify({
           key={review.key}
           card={review.value.card}
           result={review.value.result}
+          identificationOptions={normalizeIdentificationOptions(review.value.identificationOptions)}
           closeLabel="Close review"
           onApply={(values) => void apply(values)}
           onClose={() => {

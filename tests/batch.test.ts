@@ -3,6 +3,11 @@ import Dexie from 'dexie';
 import { CabinetDB, saveCard, setSetting, setting } from '../src/db';
 import { newCard, plainCard, type Suggestions, type Card } from '../src/model';
 import {
+  aiLeaseMs,
+  defaultIdentificationOptions,
+  type IdentificationOptions,
+} from '../src/ai-options';
+import {
   applyBatchReview,
   batchKey,
   checkBatchAllowance,
@@ -11,6 +16,7 @@ import {
   runBatch,
   withBatchLock,
   type IdentificationBatch,
+  type BatchReview,
 } from '../src/batch';
 
 let database: CabinetDB;
@@ -69,6 +75,69 @@ async function cards(count: number) {
 const reviewKeys = () => database.settings.where('key').startsWith(reviewPrefix).primaryKeys();
 
 describe('saved identification batches', () => {
+  it('keeps the approved model and reasoning through setting changes, pause and resume', async () => {
+    const selected = await cards(2);
+    const approved: IdentificationOptions = { model: 'gpt-6.1-terra', reasoningEffort: 'high' };
+    await setSetting('aiOptions', approved, database);
+    const job = await createBatch(
+      selected.map((card) => card.id),
+      options(),
+    );
+    expect(job.identificationOptions).toEqual(approved);
+    await setSetting('aiOptions', { model: 'gpt-6-astra', reasoningEffort: 'medium' }, database);
+    const control = new AbortController();
+    const first = vi.fn(async (_card: Card, choice?: IdentificationOptions) => {
+      expect(choice).toEqual(approved);
+      control.abort();
+      return suggestions;
+    });
+    await runBatch(job.id, { ...options(), signal: control.signal, identifyCard: first });
+    await setSetting('aiOptions', { model: 'gpt-6.1-sol', reasoningEffort: 'low' }, database);
+    const next = vi.fn(async (_card: Card, choice?: IdentificationOptions) => {
+      expect(choice).toEqual(approved);
+      return suggestions;
+    });
+    const finished = await runBatch(job.id, { ...options(), identifyCard: next });
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(finished.identificationOptions).toEqual(approved);
+    for (const key of await reviewKeys())
+      expect(
+        (await setting<BatchReview | null>(key, null, database))?.identificationOptions,
+      ).toEqual(approved);
+  });
+
+  it('uses the confirmation snapshot even if preferences changed before queue creation', async () => {
+    const [card] = await cards(1);
+    await setSetting('aiOptions', { model: 'gpt-6-astra', reasoningEffort: 'high' }, database);
+    const approved: IdentificationOptions = { model: 'gpt-6.1-sol', reasoningEffort: 'medium' };
+    const job = await createBatch([card.id], { ...options(), identificationOptions: approved });
+    expect(job.identificationOptions).toEqual(approved);
+    const identifyCard = vi.fn(async (_card: Card, choice?: IdentificationOptions) => {
+      expect(choice).toEqual(approved);
+      return suggestions;
+    });
+    await runBatch(job.id, { ...options(), identifyCard });
+  });
+
+  it('resumes a legacy queue with Luna Low rather than current preferences', async () => {
+    const [card] = await cards(1);
+    const job = await createBatch([card.id], options());
+    delete job.identificationOptions;
+    await setSetting(batchKey, job, database);
+    await setSetting('aiOptions', { model: 'gpt-6-astra', reasoningEffort: 'high' }, database);
+    const identifyCard = vi.fn(async (_card: Card, choice?: IdentificationOptions) => {
+      expect(choice).toEqual(defaultIdentificationOptions);
+      return suggestions;
+    });
+    const finished = await runBatch(job.id, { ...options(), identifyCard });
+    expect(finished.identificationOptions).toEqual(defaultIdentificationOptions);
+    const [key] = await reviewKeys();
+    expect((await setting<BatchReview | null>(key, null, database))?.identificationOptions).toEqual(
+      defaultIdentificationOptions,
+    );
+  });
+
   it('runs more than 100 cards sequentially with spacing and saves unapplied results', async () => {
     const selected = await cards(101);
     const job = await createBatch(
@@ -173,7 +242,7 @@ describe('saved identification batches', () => {
     expect(result.failures[0].error).toContain('not retried');
     expect(identifyCard).toHaveBeenCalledTimes(1);
     expect(identifyCard.mock.calls[0][0].id).toBe(selected[1].id);
-    expect(clock - originalTime).toBeGreaterThanOrEqual(120000);
+    expect(clock - originalTime).toBeGreaterThanOrEqual(aiLeaseMs);
   });
 
   it('preserves the in-flight marker when local result storage fails', async () => {

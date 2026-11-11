@@ -1,5 +1,10 @@
 import { db, type CabinetDB, setting, setSetting, saveCard, friendlyError } from './db';
-import { identify } from './ai';
+import { identify, readIdentificationOptions } from './ai';
+import {
+  aiLeaseMs,
+  normalizeIdentificationOptions,
+  type IdentificationOptions,
+} from './ai-options';
 import { auth } from './firebase';
 import { plainCard, sameCard, title, type Card, type Suggestions } from './model';
 
@@ -16,14 +21,24 @@ export type IdentificationBatch = {
   lastStart: number;
   failures: BatchFailure[];
   error: string;
+  identificationOptions?: IdentificationOptions;
 };
-export type BatchReview = { batchId: string; card: Card; result: Suggestions };
+export type BatchReview = {
+  batchId: string;
+  card: Card;
+  result: Suggestions;
+  identificationOptions?: IdentificationOptions;
+};
 export type BatchActivity = { phase: 'waiting' | 'identifying' | 'idle'; until?: number };
 type Lock = <T>(action: () => Promise<T>) => Promise<T>;
 type Options = {
   database?: CabinetDB;
   lock?: Lock;
-  identifyCard?: (card: Card) => Promise<Suggestions>;
+  identifyCard?: (
+    card: Card,
+    identificationOptions?: IdentificationOptions,
+  ) => Promise<Suggestions>;
+  identificationOptions?: IdentificationOptions;
   ready?: () => Promise<void>;
   signal?: AbortSignal;
   now?: () => number;
@@ -83,6 +98,9 @@ export async function createBatch(cardIds: string[], options: Options = {}) {
   return (options.lock || withBatchLock)(async () => {
     const ids = [...new Set(cardIds)];
     if (!ids.length) throw new Error('Choose cards to identify.');
+    const identificationOptions = normalizeIdentificationOptions(
+      options.identificationOptions ?? (await readIdentificationOptions(database)),
+    );
     await (options.ready || ready)();
     await checkBatchAllowance(ids.length, database);
     await checkCards(ids, database);
@@ -97,6 +115,7 @@ export async function createBatch(cardIds: string[], options: Options = {}) {
       lastStart: previous?.lastStart || 0,
       failures: [],
       error: '',
+      identificationOptions,
     };
     await setSetting(batchKey, batch, database);
     return batch;
@@ -127,7 +146,8 @@ export async function runBatch(batchId: string, options: Options = {}) {
     const saved = await setting<IdentificationBatch | null>(batchKey, null, database);
     if (!saved || saved.id !== batchId)
       throw new Error('The saved batch changed. Reopen it before continuing.');
-    let batch: IdentificationBatch = saved;
+    const identificationOptions = normalizeIdentificationOptions(saved.identificationOptions);
+    let batch: IdentificationBatch = { ...saved, identificationOptions };
     const save = async () => setSetting(batchKey, batch, database);
     // A stored in-flight request has an unknown outcome after a reload. Never send it again.
     if (batch.processing) {
@@ -140,8 +160,8 @@ export async function runBatch(batchId: string, options: Options = {}) {
       });
       batch.position++;
       batch.processing = null;
-      // Allow the server's two-minute in-flight lease to expire before the next card.
-      batch.lastStart = Math.max(batch.lastStart + 105000, now() - 15000);
+      // Wait out the full server lease after recovery because the old request's send time is unknown.
+      batch.lastStart = now() + aiLeaseMs - 15000;
       batch.status = 'paused';
       await save();
     }
@@ -184,7 +204,7 @@ export async function runBatch(batchId: string, options: Options = {}) {
         options.onActivity?.({ phase: 'identifying' });
         let result: Suggestions;
         try {
-          result = await identifyCard(card);
+          result = await identifyCard(card, identificationOptions);
         } catch (error) {
           const message = friendlyError(error);
           batch.failures.push({ cardId: id, name: title(card), error: message });
@@ -205,7 +225,7 @@ export async function runBatch(batchId: string, options: Options = {}) {
         await database.transaction('rw', database.settings, async () => {
           await setSetting(
             reviewPrefix + batch!.id + ':' + id,
-            { batchId: batch!.id, card, result } satisfies BatchReview,
+            { batchId: batch!.id, card, result, identificationOptions } satisfies BatchReview,
             database,
           );
           await setSetting(batchKey, next, database);

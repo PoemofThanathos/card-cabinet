@@ -10,7 +10,8 @@ import {
   products,
 } from './model';
 import { db, saveCard, setSetting, friendlyError } from './db';
-import { identify } from './ai';
+import { identify, readIdentificationOptions } from './ai';
+import { identificationLabel, type IdentificationOptions } from './ai-options';
 import { Modal, PhotoPicker } from './components';
 
 export function SuggestionReview({
@@ -19,12 +20,14 @@ export function SuggestionReview({
   onApply,
   onClose,
   closeLabel = 'Discard suggestions',
+  identificationOptions,
 }: {
   result: Suggestions;
   card: Card;
   onApply: (values: Partial<Card['fields']>) => void;
   onClose: () => void;
   closeLabel?: string;
+  identificationOptions?: IdentificationOptions;
 }) {
   const [checked, setChecked] = useState<string[]>([]);
   function apply() {
@@ -47,6 +50,9 @@ export function SuggestionReview({
   }
   return (
     <Modal title="Review identification" onClose={onClose} wide>
+      {identificationOptions && (
+        <p className="small muted">{identificationLabel(identificationOptions)}</p>
+      )}
       <p className="muted">
         Suggestions can be wrong. Select only the fields you want to apply. Inferences are separate
         from text read on the card.
@@ -113,6 +119,7 @@ export function Editor({
   const [card, setCard] = useState(initial),
     [busy, setBusy] = useState(false),
     [result, setResult] = useState<Suggestions | null>(null),
+    [resultOptions, setResultOptions] = useState<IdentificationOptions | undefined>(),
     [dirty, setDirty] = useState(false),
     [draftReady, setDraftReady] = useState(false),
     [localError, setLocalError] = useState('');
@@ -164,15 +171,19 @@ export function Editor({
     }
   }
   async function scan() {
-    if (
-      !confirm(
-        'Send copies of these two photos to your Cloudflare Worker and OpenAI for this one identification? The copies have location metadata removed. OpenAI API use may be billed separately from ChatGPT.',
-      )
-    )
-      return;
     setBusy(true);
     try {
-      setResult(await identify(card));
+      const chosen = await readIdentificationOptions();
+      if (
+        !confirm(
+          'Send copies of these two photos to your Cloudflare Worker and OpenAI using ' +
+            identificationLabel(chosen) +
+            ' for one identification? Location metadata is removed. This uses your OpenAI API balance.',
+        )
+      )
+        return;
+      setResultOptions(chosen);
+      setResult(await identify(card, chosen));
     } catch (e) {
       onError(friendlyError(e));
     } finally {
@@ -326,6 +337,7 @@ export function Editor({
         <SuggestionReview
           card={card}
           result={result}
+          identificationOptions={resultOptions}
           onClose={() => setResult(null)}
           onApply={(values) => {
             setCard((c) => ({ ...c, fields: { ...c.fields, ...values } }));

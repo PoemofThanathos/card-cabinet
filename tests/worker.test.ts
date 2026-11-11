@@ -12,6 +12,14 @@ import worker, {
 } from '../worker/index';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
+import {
+  aiModels,
+  reasoningEfforts,
+  aiRequestTimeoutMs,
+  aiClientTimeoutMs,
+  aiLeaseMs,
+  outputTokenLimits,
+} from '../src/ai-options';
 let privateKey: CryptoKey, keys: JWTVerifyGetKey;
 const env = {
   FIREBASE_PROJECT_ID: 'test-project',
@@ -63,10 +71,14 @@ function durableContext() {
   } as unknown as DurableObjectState;
   return { ctx, storage, saved: () => saved };
 }
-function scanRequest(requestId = crypto.randomUUID(), unlimited?: boolean) {
+function scanRequest(
+  requestId: string = crypto.randomUUID(),
+  unlimited?: boolean,
+  options: Record<string, unknown> = {},
+) {
   return new Request('https://internal/identify', {
     method: 'POST',
-    body: JSON.stringify({ requestId, images: [jpeg(), jpeg()], unlimited }),
+    body: JSON.stringify({ requestId, images: [jpeg(), jpeg()], unlimited, ...options }),
   });
 }
 const completedResponse = () =>
@@ -135,7 +147,7 @@ describe('Worker request boundaries', () => {
       validateScan({
         requestId: crypto.randomUUID(),
         images: [jpeg(), jpeg()],
-        model: 'expensive',
+        max_output_tokens: 999999,
       }),
     ).toThrow();
     expect(() => validateScan({ requestId: crypto.randomUUID(), images: [jpeg()] })).toThrow();
@@ -148,6 +160,31 @@ describe('Worker request boundaries', () => {
     for (const unlimited of ['true', 1, null, {}])
       expect(() => validateScan({ ...scan, unlimited })).toThrow();
   });
+  it.each([
+    { model: 'unapproved-model' },
+    { model: null },
+    { model: 12 },
+    { reasoningEffort: 'none' },
+    { reasoningEffort: 'max' },
+    { reasoningEffort: null },
+    { reasoningEffort: true },
+    { max_output_tokens: 999999 },
+  ])(
+    'rejects invalid model or reasoning options before reserving or calling OpenAI: %j',
+    async (options) => {
+      const value = { requestId: crypto.randomUUID(), images: [jpeg(), jpeg()], ...options };
+      expect(() => validateScan(value)).toThrow();
+      const { ctx, storage } = durableContext();
+      const fetcher = vi.fn();
+      vi.stubGlobal('fetch', fetcher);
+      await expect(
+        new ScanGate(ctx, env).fetch(scanRequest(crypto.randomUUID(), false, options)),
+      ).rejects.toThrow();
+      expect(storage.get).not.toHaveBeenCalled();
+      expect(storage.put).not.toHaveBeenCalled();
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
   it('rejects EXIF metadata and oversized dimensions', () => {
     const bytes = readFileSync(new URL('./fixtures/card.jpg', import.meta.url));
     const exif = Buffer.concat([
@@ -188,6 +225,15 @@ describe('Worker request boundaries', () => {
   });
 });
 describe('durable usage limits', () => {
+  it('keeps the reservation through the longer request window and releases expired leases', () => {
+    const now = Date.UTC(2026, 10, 11);
+    const first = reserve(undefined, crypto.randomUUID(), now).state;
+    expect(first.leaseUntil).toBe(now + aiLeaseMs);
+    expect(aiLeaseMs).toBeGreaterThan(aiClientTimeoutMs);
+    expect(aiClientTimeoutMs).toBeGreaterThan(aiRequestTimeoutMs);
+    expect(reserve(first, crypto.randomUUID(), now + aiLeaseMs - 1).error).toContain('running');
+    expect(reserve(first, crypto.randomUUID(), now + aiLeaseMs).error).toBeUndefined();
+  });
   it('enforces one in-flight scan, spacing and daily limits', () => {
     const now = Date.UTC(2026, 10, 9);
     const id = crypto.randomUUID();
@@ -335,6 +381,56 @@ describe('durable usage limits', () => {
   );
 });
 describe('mocked OpenAI structured outputs', () => {
+  it.each(
+    aiModels.flatMap((model) =>
+      reasoningEfforts.map((reasoningEffort) => ({ model, reasoningEffort })),
+    ),
+  )(
+    'forwards $model with $reasoningEffort reasoning and its output budget',
+    async ({ model, reasoningEffort }) => {
+      const { ctx } = durableContext();
+      const fetcher = vi.fn(async (_url: unknown, _options?: RequestInit) => completedResponse());
+      vi.stubGlobal('fetch', fetcher);
+      const timeout = vi.spyOn(AbortSignal, 'timeout');
+      const options = { model, reasoningEffort };
+      const validated = validateScan({
+        requestId: crypto.randomUUID(),
+        images: [jpeg(), jpeg()],
+        ...options,
+      });
+      expect(validated).toMatchObject(options);
+      expect(
+        (await new ScanGate(ctx, env).fetch(scanRequest(validated.requestId, false, options)))
+          .status,
+      ).toBe(200);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(fetcher.mock.calls[0][0]).toBe('https://api.openai.com/v1/responses');
+      const body = JSON.parse(fetcher.mock.calls[0][1]!.body as string);
+      expect(body.model).toBe(model);
+      expect(body.reasoning).toEqual({ effort: reasoningEffort });
+      expect(body.max_output_tokens).toBe(outputTokenLimits[reasoningEffort]);
+      expect(body.store).toBe(false);
+      expect(body.text.format.strict).toBe(true);
+      expect(
+        body.input[0].content.filter((item: { type: string }) => item.type === 'input_image'),
+      ).toHaveLength(2);
+      expect(timeout).toHaveBeenCalledWith(aiRequestTimeoutMs);
+    },
+  );
+  it('uses the server model and low reasoning for legacy requests without weakening replay protection', async () => {
+    const { ctx } = durableContext();
+    const fetcher = vi.fn(async (_url: unknown, _options?: RequestInit) => completedResponse());
+    vi.stubGlobal('fetch', fetcher);
+    const id = crypto.randomUUID();
+    const gate = new ScanGate(ctx, { ...env, OPENAI_MODEL: 'gpt-6.1-terra' });
+    expect((await gate.fetch(scanRequest(id))).status).toBe(200);
+    const body = JSON.parse(fetcher.mock.calls[0][1]!.body as string);
+    expect(body.model).toBe('gpt-6.1-terra');
+    expect(body.reasoning).toEqual({ effort: 'low' });
+    expect(body.max_output_tokens).toBe(outputTokenLimits.low);
+    expect((await gate.fetch(scanRequest(id))).status).toBe(429);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
   it('uses the server model, both images, strict schema and no storage', async () => {
     const fetcher = vi.fn(async (_url: unknown, _options?: RequestInit) =>
       Response.json({

@@ -1,8 +1,22 @@
 import { auth } from './firebase';
-import { db, setting, photoBlob } from './db';
+import { db, setting, photoBlob, type CabinetDB } from './db';
 import { suggestionSchema, type Card } from './model';
 import { transmittedPhoto } from './photos';
-export async function identify(card: Card) {
+import {
+  aiClientTimeoutMs,
+  defaultIdentificationOptions,
+  normalizeIdentificationOptions,
+  type IdentificationOptions,
+} from './ai-options';
+
+export async function readIdentificationOptions(database: CabinetDB = db) {
+  return normalizeIdentificationOptions(
+    await setting<unknown>('aiOptions', defaultIdentificationOptions, database),
+  );
+}
+
+export async function identify(card: Card, options?: IdentificationOptions) {
+  const chosen = options ?? (await readIdentificationOptions());
   if (!(await setting('aiEnabled', false)))
     throw new Error('Enable identification in Settings first.');
   if (!auth?.currentUser)
@@ -44,8 +58,8 @@ export async function identify(card: Card) {
   const response = await fetch(url.replace(/\/$/, '') + '/identify', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-    body: JSON.stringify({ requestId: crypto.randomUUID(), images, unlimited }),
-    signal: AbortSignal.timeout(60000),
+    body: JSON.stringify({ requestId: crypto.randomUUID(), images, unlimited, ...chosen }),
+    signal: AbortSignal.timeout(aiClientTimeoutMs),
   });
   let result: unknown;
   try {

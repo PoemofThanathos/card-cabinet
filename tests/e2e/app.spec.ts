@@ -176,10 +176,26 @@ test('project subpath, manifest, screenshots and no horizontal overflow', async 
   await page.screenshot({ path: testInfo.outputPath('collection.png'), fullPage: true });
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await expect(page.getByText('Firebase is not configured yet.')).toBeVisible();
+  const model = page.getByRole('combobox', { name: 'Identification model', exact: true });
+  const reasoning = page.getByRole('combobox', { name: 'Reasoning effort', exact: true });
+  await expect(model).toHaveValue('gpt-6-luna');
+  await expect(reasoning).toHaveValue('low');
+  await expect(model.locator('option')).toHaveText([
+    'GPT-6 Luna',
+    'GPT-6.1 Terra',
+    'GPT-6.1 Sol',
+    'GPT-6 Astra',
+  ]);
+  await expect(reasoning.locator('option')).toHaveText(['Low', 'Medium', 'High']);
+  await model.selectOption('gpt-6-astra');
+  await reasoning.selectOption('high');
+  await expect(reasoning).toBeEnabled();
   await page.getByLabel('Enable Identify on this device').check();
   await expect(page.getByText('Identification enabled on this device.')).toBeVisible();
   await page.reload();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(model).toHaveValue('gpt-6-astra');
+  await expect(reasoning).toHaveValue('high');
   await expect(page.getByLabel('Enable Identify on this device')).toBeChecked();
   await expect(page.getByLabel('Unlimited attempts', { exact: true })).not.toBeChecked();
   await page.getByLabel('Unlimited attempts', { exact: true }).check();

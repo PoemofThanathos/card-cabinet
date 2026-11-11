@@ -1,6 +1,37 @@
 import { test, expect } from '@playwright/test';
 import { newCard } from '../../src/model';
 
+test('individual identification confirms the selected model and reasoning before sending', async ({
+  page,
+}) => {
+  await page.goto('./');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Add test cards', exact: true }).click();
+  await expect(
+    page.getByText('12 test cards added. Their artwork and card details are fictional.'),
+  ).toBeVisible();
+  await page.getByLabel('Identification model', { exact: true }).selectOption('gpt-6.1-sol');
+  await expect(page.getByLabel('Reasoning effort', { exact: true })).toBeEnabled();
+  await page.getByLabel('Reasoning effort', { exact: true }).selectOption('medium');
+  await expect(page.getByLabel('Identification model', { exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: /^All cards/ }).click();
+  await page.locator('.collection-card .card-open').first().click();
+  await page.getByRole('button', { name: 'Edit card', exact: true }).click();
+  const sent: string[] = [];
+  page.on('request', (request) => {
+    if (request.url().endsWith('/identify')) sent.push(request.url());
+  });
+  const confirmation = page.waitForEvent('dialog');
+  const click = page.getByRole('button', { name: 'Identify', exact: true }).click();
+  const dialog = await confirmation;
+  expect(dialog.type()).toBe('confirm');
+  expect(dialog.message()).toContain('GPT-6.1 Sol · Medium reasoning');
+  await dialog.dismiss();
+  await click;
+  await expect(page.getByRole('button', { name: 'Identify', exact: true })).toBeEnabled();
+  expect(sent).toEqual([]);
+});
+
 test('more than three selected cards reach the batch confirmation', async ({ page }) => {
   await page.goto('./');
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
@@ -16,6 +47,7 @@ test('more than three selected cards reach the batch confirmation', async ({ pag
   await expect(
     page.getByRole('heading', { name: 'Batch identification', exact: true }),
   ).toBeVisible();
+  await expect(page.getByText(/GPT-6 Luna · Low reasoning/)).toBeVisible();
   await page.getByRole('button', { name: 'Start identification of 12 cards' }).click();
   await expect(page.getByText('Enable identification in Settings first.')).toBeVisible();
 });
@@ -39,6 +71,10 @@ test('saved batch review survives closing and discards only on explicit action',
       await new Promise<void>((resolve, reject) => {
         const tx = database.transaction(['cards', 'settings'], 'readwrite');
         tx.objectStore('cards').put({ ...card, baseRev: 0, localVersion: 1, syncedVersion: 0 });
+        tx.objectStore('settings').put({
+          key: 'aiOptions',
+          value: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+        });
         tx.objectStore('settings').put({
           key: 'aiBatch',
           value: {
@@ -81,9 +117,13 @@ test('saved batch review survives closing and discards only on explicit action',
   );
   await page.reload();
   await page.getByRole('button', { name: 'Open identification batch', exact: true }).click();
+  await expect(page.getByText('GPT-6 Luna · Low reasoning', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Review Batch test card', exact: true }).click();
   await expect(
     page.getByRole('heading', { name: 'Review identification', exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.locator('dialog').last().getByText('GPT-6 Luna · Low reasoning', { exact: true }),
   ).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('batch-review.png'), fullPage: true });
   await page.getByRole('button', { name: 'Close review', exact: true }).click();

@@ -61,9 +61,48 @@ describe('identification allowance', () => {
     const body = JSON.parse(options.body as string);
     expect(url).toBe('https://worker.example/identify');
     expect(body.unlimited).toBe(false);
+    expect(body).toMatchObject({ model: 'gpt-6-luna', reasoningEffort: 'low' });
     expect(body.images).toHaveLength(2);
     expect(options.headers).toMatchObject({ Authorization: 'Bearer test-token' });
     expect(await setting('aiUsage', { day: '', count: 0 })).toEqual({ day: day(), count: 1 });
+  });
+
+  it('sends the saved model and reasoning selection without changing it during preparation', async () => {
+    await setSetting('aiOptions', { model: 'gpt-6.1-terra', reasoningEffort: 'high' });
+    identity.getIdToken.mockImplementation(async () => {
+      await setSetting('aiOptions', { model: 'gpt-6.1-sol', reasoningEffort: 'medium' });
+      return 'test-token';
+    });
+    await identify(card);
+    const [, options] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toMatchObject({
+      model: 'gpt-6.1-terra',
+      reasoningEffort: 'high',
+    });
+  });
+
+  it('honors explicitly confirmed settings instead of newer device preferences', async () => {
+    await setSetting('aiOptions', { model: 'gpt-6-luna', reasoningEffort: 'low' });
+    await identify(card, { model: 'gpt-6-astra', reasoningEffort: 'medium' });
+    const [, options] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toMatchObject({
+      model: 'gpt-6-astra',
+      reasoningEffort: 'medium',
+    });
+    expect(await setting('aiOptions', null)).toEqual({
+      model: 'gpt-6-luna',
+      reasoningEffort: 'low',
+    });
+  });
+
+  it('uses the default model and reasoning for invalid saved preferences', async () => {
+    await setSetting('aiOptions', { model: 'unrecognized-model', reasoningEffort: 'max' });
+    await identify(card);
+    const [, options] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toMatchObject({
+      model: 'gpt-6-luna',
+      reasoningEffort: 'low',
+    });
   });
 
   it('allows scans beyond the count cap only when unlimited is on and keeps counting', async () => {
