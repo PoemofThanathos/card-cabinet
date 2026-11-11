@@ -17,6 +17,7 @@ export type BulkEntryPlan = {
   id: string;
   kind: 'photos' | 'manual' | 'base';
   entries: BulkEntry[];
+  identifyAfterSaving?: boolean;
 };
 export const bulkEntryKey = 'bulkEntryDraft';
 const normalized = (value: string) => value.normalize('NFKC').trim().toLocaleLowerCase();
@@ -165,7 +166,12 @@ export function bulkCard(
 export function savedEntryIds(plan: BulkEntryPlan) {
   return plan.entries.filter((entry) => entry.state === 'saved').map((entry) => entry.card.id);
 }
-type PlanHeader = { id: string; kind: BulkEntryPlan['kind']; count: number };
+type PlanHeader = {
+  id: string;
+  kind: BulkEntryPlan['kind'];
+  count: number;
+  identifyAfterSaving?: boolean;
+};
 const entryPrefix = (id: string) => `bulkEntry:${id}:`;
 const entryKey = (id: string, index: number) => entryPrefix(id) + String(index).padStart(16, '0');
 export async function getBulkEntryPlan(database = db) {
@@ -174,7 +180,12 @@ export async function getBulkEntryPlan(database = db) {
   const rows = await database.settings.where('key').startsWith(entryPrefix(header.id)).toArray();
   if (rows.length !== header.count)
     throw new Error('The saved import is incomplete. Your collection is still available.');
-  return { id: header.id, kind: header.kind, entries: rows.map((row) => row.value as BulkEntry) };
+  return {
+    id: header.id,
+    kind: header.kind,
+    ...(header.identifyAfterSaving ? { identifyAfterSaving: true } : {}),
+    entries: rows.map((row) => row.value as BulkEntry),
+  };
 }
 export async function storeBulkEntryPlan(plan: BulkEntryPlan, database = db) {
   await database.transaction('rw', database.settings, async () => {
@@ -186,7 +197,12 @@ export async function storeBulkEntryPlan(plan: BulkEntryPlan, database = db) {
     );
     await database.settings.put({
       key: bulkEntryKey,
-      value: { id: plan.id, kind: plan.kind, count: plan.entries.length } satisfies PlanHeader,
+      value: {
+        id: plan.id,
+        kind: plan.kind,
+        count: plan.entries.length,
+        ...(plan.identifyAfterSaving ? { identifyAfterSaving: true } : {}),
+      } satisfies PlanHeader,
     });
   });
 }

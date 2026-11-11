@@ -5,14 +5,16 @@ Updated 11 November 2026. Automated tests use generated fixtures, fake credentia
 ## Implemented
 
 - Offline collection with a set grid, a card list inside each set, an All cards list and a player grid. Manual entry, edit, physical-copy duplication, archive, recoverable deletion, search and filters remain available.
-- Twelve fictional test cards with generated front/back artwork, available from Settings. Adding examples preserves existing records and does not overwrite edited or deleted examples.
+- Twelve fictional test cards with generated front/back artwork, available from Settings. Adding examples preserves existing records and does not overwrite edited or deleted examples. Remove test cards moves originals and marked copies to Recently deleted while retaining their photos and sync history.
 - Front/back camera inputs and file-picker fallback, rotation, crop, local JPEG encoding and explicit missing-photo status.
+- A local HEIC/HEIF fallback decoder, loaded when native decoding fails, with serialized conversion and bounded preview caching. Decode errors replace the loading placeholder without hiding a readable second photo.
 - Local drafts, atomic IndexedDB writes, database migrations and separate saved/synced/photo indicators.
 - Versioned ZIP backups, SHA-256 verification, restore, reviewed merge, repeated-import safety and CSV export.
 - Firebase email/password integration, a persistent operation queue, revision transactions and conflict/deletion review.
 - Owner-only Firestore rules with field validation, revision checks and authenticated, expiring pairing records.
 - A protected Worker with Firebase token verification, image/request validation, allowed model choices, a server off switch and SQLite Durable Object limits.
 - Bulk entry from photo pairs, pasted manual lists and base-set number ranges. Photo pairing supports alternating front/back files or all fronts followed by all backs, with review, swap and skip controls. There is no photo-count cap. Each card and its import progress save together, so a partial import can resume without repeating completed entries.
+- Optional AI photo matching analyzes independent photos in requests of up to two, then proposes unique matches across the full selection. Unknown sides, duplicate identities and conflicting details remain unmatched. Reviewed swaps and manual pairs persist. Accepted pairs accumulate in the import, and unmatched photos retain their saved analysis. Saving reviewed pairs opens the ordinary identification confirmation.
 - Base-set entry records only ownership confirmed by the user, using a complete set, a list of missing numbers or a list of owned numbers. It does not infer player names, parallels, autographs or memorabilia. Repeating a base-set import skips already recorded base numbers while preserving existing physical copies and variants.
 - Explicit single-card identification and confirmed sequential batches, with saved progress and suggestions, pause/resume, cross-tab locking and review before applying fields. Interrupted or failed requests are not retried automatically. A changed card keeps its current values and saved suggestions for review.
 - Settings offer GPT-6 Luna, GPT-6.1 Terra, GPT-6.1 Sol and GPT-6 Astra, each with Low, Medium and High reasoning. Choices persist locally and appear before sending. Batches and saved reviews retain their selected options; legacy batches use Luna Low.
@@ -23,7 +25,9 @@ Updated 11 November 2026. Automated tests use generated fixtures, fake credentia
 
 ## Automated checks
 
-The 11 November model-selector revision passed **117 unit/integration tests, all 18 browser checks across Chromium and WebKit, and the TypeScript/Vite build**. The build and browser tests use the `/card-cabinet/` project subpath. Mobile screenshots were reviewed. Browser tests use isolated local collections and mocked identification results. All twelve model/reasoning combinations are covered by mocked Worker requests. Persistence, request snapshots, legacy batches, invalid options and interruption timing are also covered.
+The 11 November photo-matching revision passed **191 unit/integration tests, 29 browser checks across Chromium and WebKit, and the TypeScript/Vite build**. One WebKit offline-decoder check is intentionally skipped because the Windows test runtime does not support that service-worker scenario. Chromium covers offline first-use HEIC conversion. The build and browser tests use the `/card-cabinet/` project subpath. Mobile screenshots were reviewed. Browser tests use isolated local collections and mocked identification results. All twelve model/reasoning combinations are covered by mocked Worker requests. Persistence, request snapshots, legacy batches, invalid options and interruption timing are also covered.
+
+Photo-matching checks cover shuffled inputs, opposite sides in different requests, duplicate copies, conflicting identities, 103 files, interrupted requests, failed storage, saved manual pair edits, and atomic acceptance without losing previously accepted or unmatched photos. Browser checks exercise the review-to-save-to-identification flow and recoverable test-card removal. A small HEIC fixture from libheif's test suite covers native/fallback import, rotation, crop, JPEG output without EXIF, and recovery from a corrupt file. This does not establish support for every iPhone HEIC variant or performance with 462 full-size photos.
 
 The earlier collection-view revision passed 50 unit/integration tests and 8 Chromium/WebKit browser tests. The earlier implementation also passed 5 Firestore emulator tests, a fresh `npm ci` and a Wrangler deployment dry run. Firestore rules and dependencies are unchanged by the credential setup. The Worker is now active, as recorded below.
 
@@ -64,7 +68,7 @@ On 10 November 2026, the owner signed in to the published app and confirmed link
 
 On 11 November 2026, a key for the Card Storage OpenAI project was created through encrypted connector delivery. The authorized local copy is in the ignored `worker/.dev.vars` file; the deployed copy is a Worker secret. The key is excluded from frontend code, GitHub, backups and screenshots. An authenticated Responses API request asking `gpt-6-luna` for a haiku succeeded. This confirms API access, not the remaining account balance.
 
-The Worker is active on Workers Free at [card-cabinet-identify.rousilon666.workers.dev](https://card-cabinet-identify.rousilon666.workers.dev), with `AI_ENABLED=true`. The model-selector version is `f546dccf-5203-4f73-a33c-0dab1b2f1b30`.
+The Worker is active on Workers Free at [card-cabinet-identify.rousilon666.workers.dev](https://card-cabinet-identify.rousilon666.workers.dev), with `AI_ENABLED=true`. The photo-matching version is `7152500d-8204-429a-b25a-86cffdbb47bd`.
 
 Live HTTP checks returned:
 
@@ -84,6 +88,8 @@ Suggestions included the English and Japanese names, `大谷翔平`, BBM, 2024 a
 
 This one generated fixture exercised Firebase authentication, Worker image validation, Durable Object accounting, the live OpenAI response and saved review. It does not establish accuracy on real cards, performance on large camera photos or sustained batch reliability.
 
+The model-selector release also completed one live Astra/High scan of the generated card. For the photo-matching release, the production Worker request function sent two newly generated front/back fixtures directly to OpenAI using Luna/Low. It returned two valid ordered entries with the correct sides and shared name, maker, set, year and card number. That check validates the new live response schema and prompt, not a full user-photo import through the deployed Worker. No real collection photos were sent during this release's verification.
+
 ## Not verified by these checks
 
 Live sync between two physical devices and account-specific quota behavior remain unverified.
@@ -98,6 +104,6 @@ The app has no global card-count limit or photo-count cap for bulk entry. It doe
 
 ## Dependency audit
 
-The last runtime dependency audit reported no known vulnerabilities. Dependencies have not changed in this revision. The full development-tool audit retained a low-severity `deepmerge` prototype-poisoning advisory inherited by Workbox's build tools. At the time of the check, the latest `deepmerge` version was still affected; npm suggested downgrading the PWA plugin to an obsolete version. This project keeps the maintained plugin and documents the build-only advisory. It does not merge untrusted user objects through that build tool. This is not a claim that dependencies can never contain vulnerabilities.
+The runtime dependency audit after adding `libheif-js` 1.23.5 reported no known vulnerabilities. The HEIC decoder retains its LGPL license as a separate replaceable asset with [notices and source links](../public/third-party/README.txt). The previous full development-tool audit retained a low-severity `deepmerge` prototype-poisoning advisory inherited by Workbox's build tools. At the time of that check, the latest `deepmerge` version was still affected; npm suggested downgrading the PWA plugin to an obsolete version. This project keeps the maintained plugin and documents the build-only advisory. It does not merge untrusted user objects through that build tool. This is not a claim that dependencies can never contain vulnerabilities.
 
 Patched transitive versions of gRPC, OpenTelemetry core, glob, minimatch and uuid are pinned through npm overrides. They were tested with the resulting lockfile. Re-run the build and tests after future dependency changes. Do not apply `npm audit fix --force` without reviewing its proposed versions.

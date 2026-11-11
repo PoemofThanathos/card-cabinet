@@ -1,6 +1,6 @@
 # Card Cabinet
 
-[Open Card Cabinet](https://poemofthanathos.github.io/card-cabinet/). Choose **Settings > Add test cards** to try the app with 12 fictional cards. Each browser keeps its own collection.
+[Open Card Cabinet](https://poemofthanathos.github.io/card-cabinet/). Choose **Settings > Add test cards** to try the app with 12 fictional cards. **Remove test cards** moves the examples and marked copies to Recently deleted, where they and their photos can be restored. Each browser keeps its own collection.
 
 A personal card collection app for iPhone Safari and Windows Edge or Chrome. Manual entry, photos, editing, search and backups work without an account. Firebase metadata sync and OpenAI identification are optional.
 
@@ -11,6 +11,8 @@ The app has no card-count limit or subscription. Device storage and service quot
 Copyright 2026 PoemofThanathos. The original Card Cabinet code, documentation and generated artwork are licensed under [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International](LICENSE), or CC BY-NC-ND 4.0. It allows noncommercial sharing with attribution and private adaptations, but does not permit sharing adapted material. The [full legal code](https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode.en) controls these permissions and includes the warranty disclaimer.
 
 Third-party libraries retain their own licenses. This project's license does not restrict rights granted by those libraries' licenses.
+
+The HEIC decoder is a separate, replaceable LGPL asset. Its license, source links and replacement instructions are in the [decoder notices](public/third-party/README.txt). The app's NoDerivatives restriction does not restrict the LGPL rights to modify, replace or debug that library.
 
 Public GitHub repositories remain subject to [GitHub's platform permissions to view and fork them](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository). CC BY-NC-ND 4.0 does not disable the Fork button or override those platform permissions.
 
@@ -54,13 +56,19 @@ No Firebase configuration is needed for local use. `npm ci` downloads dependenci
 
 The original camera file is not retained by this app. Use photo stores the edited JPEG, with a maximum edge of 2560 pixels and quality 0.92. Keep originals in Photos or Files if you want an archival source beyond the app's edited image. Canvas conversion removes EXIF, including GPS. Check small Japanese print before saving or identifying.
 
-HEIC support depends on the browser's decoder. If it fails, export a JPEG or use iPhone Camera > Formats > Most Compatible. A file-picker fallback is always available. Real camera, HEIC and orientation behavior still need the [iPhone checklist](docs/device-checklist.md).
+HEIC/HEIF photos use the browser's decoder first, then a bundled local decoder if needed. Conversion runs one image at a time without uploading originals to a conversion service. The offline cache includes the decoder. Unsupported or damaged images show an error and can be replaced with a JPEG export. Real camera formats and orientation still need the [iPhone checklist](docs/device-checklist.md).
 
 ## Bulk entry and base sets
 
 Choose **Bulk add** to import photos, paste a manual card list, or add owned base cards by checklist number. There is no fixed photo-count limit. Browser memory, available storage and individual image limits still apply.
 
 Photo imports sort filenames naturally, then pair alternating front/back images or all fronts followed by all backs. Review the pairing and swap sides before saving. The app processes one pair at a time. Saved cards survive an interrupted import; reopen Bulk add and reselect the original files to continue.
+
+Choose **Match and identify with AI** beside Review import or above the photo-pair review. Confirm the photo count and model before sending. AI reads up to two independent photos per request; the app compares the printed identities across the whole selection. It proposes only unique front/back matches with compatible details. Conflicting identities, indistinguishable copies and unknown sides remain unmatched. Odd photo counts are supported in this mode.
+
+Review the proposed pairs, swap or unpair them, and use the unmatched-photo controls to pair uncertain photos manually. These edits and completed analysis stay on this device. **Use pairs** adds the reviewed pairs to the import without dropping unused photos or previously accepted pairs. **Save and identify** saves the photos locally and opens the normal batch-identification confirmation. Catalogue suggestions still require review before applying fields.
+
+Matching needs one API request per two photos, rounded up; identification needs one more per card. Both use the configured model and the same attempt limits. Large selections need Unlimited attempts enabled. Requests run sequentially with a 15-second interval. Keep the app open. Closing pauses after the current request; reselect originals to resume after reopening. Failed or interrupted requests are not retried automatically. Matching drafts and reviews are excluded from backups until their cards are saved and fields applied.
 
 Manual lists accept one physical card per line, with name, card number, team and rarity separated by tabs or `|`. Shared set details apply to every row. No photos or AI are required.
 
@@ -251,7 +259,7 @@ Playwright WebKit on Windows is not an iPhone. The automated offline service-wor
 | Cannot reopen offline     | Open the production build online once and wait for offline-ready. Check storage availability. Development mode does not install the production service worker. |
 | Photos missing after sync | Expected on a new device. Import a ZIP containing those photos.                                                                                                |
 | Storage full              | Keep the existing data. Export smaller backups, verify them, and free unrelated device space. Failed transactions preserve earlier saved cards.                |
-| HEIC fails                | Use a JPEG or PNG export, or Most Compatible camera format.                                                                                                    |
+| HEIC fails                | Reopen online to download the local decoder. If the file remains unreadable, export it as JPEG or PNG.                                                                                                    |
 | Sync permission denied    | UID in rules, frontend configuration and signed-in user must agree. Publish rules to the correct project.                                                      |
 | Sync quota reached        | Continue locally. Wait for the free quota reset; avoid repeated full syncs.                                                                                    |
 | Wrong user signed in      | Sign out. Local records remain. A linked collection cannot be rebound silently to another UID.                                                                 |

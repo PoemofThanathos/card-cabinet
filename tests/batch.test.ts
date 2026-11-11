@@ -75,6 +75,47 @@ async function cards(count: number) {
 const reviewKeys = () => database.settings.where('key').startsWith(reviewPrefix).primaryKeys();
 
 describe('saved identification batches', () => {
+  it('refreshes the photo-matching cooldown before resuming an older identification queue', async () => {
+    const [card] = await cards(1);
+    const job = await createBatch([card.id], options());
+    clock += 500;
+    await setSetting('aiPhotoMatchingLastAttemptAt', clock, database);
+    const matchedAt = clock;
+    const identifyCard = vi.fn(async () => {
+      expect(clock - matchedAt).toBeGreaterThanOrEqual(15000);
+      return suggestions;
+    });
+    const result = await runBatch(job.id, { ...options(), identifyCard });
+    expect(identifyCard).toHaveBeenCalledTimes(1);
+    expect(result.failures).toEqual([]);
+    expect(result.status).toBe('complete');
+  });
+
+  it.each(['new', 'resumed'] as const)(
+    'waits out an unknown photo-analysis request before a %s identification queue',
+    async (mode) => {
+      const [card] = await cards(1);
+      const saved = mode === 'resumed' ? await createBatch([card.id], options()) : null;
+      const matching = {
+        processing: ['front.jpg', 'back.jpg'],
+        lastAttemptAt: clock,
+        notBefore: 0,
+      };
+      await setSetting('aiPhotoMatching', matching, database);
+      await setSetting('aiPhotoMatchingLastAttemptAt', clock, database);
+      const job = saved ?? (await createBatch([card.id], options()));
+      const resumedAt = clock;
+      const identifyCard = vi.fn(async () => {
+        expect(clock - resumedAt).toBeGreaterThanOrEqual(aiLeaseMs);
+        return suggestions;
+      });
+      const result = await runBatch(job.id, { ...options(), identifyCard });
+      expect(identifyCard).toHaveBeenCalledTimes(1);
+      expect(result.failures).toEqual([]);
+      expect(await setting('aiPhotoMatching', null, database)).toEqual(matching);
+    },
+  );
+
   it('keeps the approved model and reasoning through setting changes, pause and resume', async () => {
     const selected = await cards(2);
     const approved: IdentificationOptions = { model: 'gpt-6.1-terra', reasoningEffort: 'high' };

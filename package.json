@@ -22,6 +22,7 @@
     "fflate": "^0.8.2",
     "firebase": "^13.2.0",
     "jose": "^6.1.0",
+    "libheif-js": "1.23.5",
     "lucide-react": "^1.70.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

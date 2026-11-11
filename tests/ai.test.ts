@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { db, setSetting, setting } from '../src/db';
 import { newCard, type Card } from '../src/model';
-import { identify } from '../src/ai';
+import { analyzePhotos, identify } from '../src/ai';
 import { transmittedPhoto } from '../src/photos';
 
 const identity = vi.hoisted(() => ({ getIdToken: vi.fn() }));
@@ -31,6 +31,79 @@ beforeEach(async () => {
   fetcher = vi.fn(async () => Response.json({ suggestions: [], warnings: [] }));
   vi.stubGlobal('fetch', fetcher);
   vi.stubEnv('VITE_WORKER_URL', 'https://worker.example');
+});
+
+describe('photo analysis requests', () => {
+  const options = { model: 'gpt-6.1-sol', reasoningEffort: 'medium' } as const;
+  const description = {
+    side: 'front',
+    name: 'Printed name',
+    maker: 'Topps',
+    set: '',
+    year: '',
+    cardNumber: '',
+    variant: '',
+    serial: '',
+    evidence: 'Player name and maker logo',
+    warnings: [],
+  };
+  const photo = () => new Blob(['photo fixture'], { type: 'image/jpeg' });
+
+  it.each([1, 2])('analyzes %i independent photos in one billed attempt', async (count) => {
+    fetcher.mockResolvedValue(
+      Response.json({ photos: Array.from({ length: count }, () => description) }),
+    );
+    const result = await analyzePhotos(Array.from({ length: count }, photo), options);
+    const [, request] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(request.body as string);
+    expect(body).toMatchObject({ task: 'analyze_photos', ...options });
+    expect(body.images).toHaveLength(count);
+    expect(result.photos).toHaveLength(count);
+    expect(transmittedPhoto).toHaveBeenCalledTimes(count);
+    expect(await setting('aiUsage', null)).toEqual({ day: day(), count: 1 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([0, 3])(
+    'refuses %i photos before any outbound request or allowance reservation',
+    async (count) => {
+      await expect(analyzePhotos(Array.from({ length: count }, photo), options)).rejects.toThrow(
+        'one or two',
+      );
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(transmittedPhoto).not.toHaveBeenCalled();
+      expect(await setting('aiUsage', null)).toBeNull();
+    },
+  );
+
+  it('rejects a mismatched response count without retrying or refunding the attempt', async () => {
+    fetcher.mockResolvedValue(Response.json({ photos: [description] }));
+    await expect(analyzePhotos([photo(), photo()], options)).rejects.toThrow('wrong number');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await setting('aiUsage', null)).toEqual({ day: day(), count: 1 });
+  });
+
+  it('shares the same switch, quota and concurrent reservation with card identification', async () => {
+    await setSetting('aiEnabled', false);
+    await expect(analyzePhotos([photo()], options)).rejects.toThrow('Enable identification');
+    await setSetting('aiEnabled', true);
+    await setSetting('aiUsage', { day: day(), count: 3 });
+    await expect(analyzePhotos([photo()], options)).rejects.toThrow('daily scan limit');
+    expect(fetcher).not.toHaveBeenCalled();
+    await setSetting('aiUsage', { day: day(), count: 2 });
+    fetcher.mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string);
+      return Response.json(
+        body.task === 'analyze_photos'
+          ? { photos: [description] }
+          : { suggestions: [], warnings: [] },
+      );
+    });
+    const results = await Promise.allSettled([analyzePhotos([photo()], options), identify(card)]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await setting('aiUsage', null)).toEqual({ day: day(), count: 3 });
+  });
 });
 afterEach(async () => {
   await db.delete();

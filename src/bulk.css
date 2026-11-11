@@ -95,6 +95,19 @@
 .bulk-add .modal-footer {
   flex-wrap: wrap;
 }
+.ai-photo-match progress {
+  width: 100%;
+}
+.ai-photo-match details {
+  margin: 20px 0;
+}
+.ai-photo-match summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.ai-photo-match .button-row {
+  flex-wrap: wrap;
+}
 @media (max-width: 540px) {
   .bulk-common {
     padding: 10px;

@@ -93,6 +93,20 @@ async function checkCards(ids: string[], database: CabinetDB) {
   }
 }
 
+async function photoMatchingLastStart(database: CabinetDB, now: () => number) {
+  const matching = await setting<{
+    processing?: string[] | null;
+    lastAttemptAt?: number;
+    notBefore?: number;
+  } | null>('aiPhotoMatching', null, database);
+  return Math.max(
+    await setting<number>('aiPhotoMatchingLastAttemptAt', 0, database),
+    matching?.lastAttemptAt || 0,
+    (matching?.notBefore || 0) - 15000,
+    matching?.processing?.length ? now() + aiLeaseMs - 15000 : 0,
+  );
+}
+
 export async function createBatch(cardIds: string[], options: Options = {}) {
   const database = options.database || db;
   return (options.lock || withBatchLock)(async () => {
@@ -112,7 +126,10 @@ export async function createBatch(cardIds: string[], options: Options = {}) {
       position: 0,
       processing: null,
       status: 'paused',
-      lastStart: previous?.lastStart || 0,
+      lastStart: Math.max(
+        previous?.lastStart || 0,
+        await photoMatchingLastStart(database, options.now || Date.now),
+      ),
       failures: [],
       error: '',
       identificationOptions,
@@ -174,6 +191,7 @@ export async function runBatch(batchId: string, options: Options = {}) {
     await (options.ready || ready)();
     await checkBatchAllowance(batch.cardIds.length - batch.position, database);
     await checkCards(batch.cardIds.slice(batch.position), database);
+    batch.lastStart = Math.max(batch.lastStart, await photoMatchingLastStart(database, now));
     batch.status = 'running';
     batch.error = '';
     await save();

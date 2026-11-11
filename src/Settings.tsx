@@ -4,7 +4,7 @@ import { type User } from 'firebase/auth';
 import { Cloud, HardDrive, ScanLine, ExternalLink, ShieldCheck } from 'lucide-react';
 import { auth, firebaseConfigured, login, signOut } from './firebase';
 import { db, setting, setSetting, friendlyError } from './db';
-import { addSampleCards, sampleCardIds } from './samples';
+import { addSampleCards, countSampleCards, removeSampleCards, sampleCardIds } from './samples';
 import {
   aiModels,
   reasoningEfforts,
@@ -50,6 +50,7 @@ export function Settings({
       lastBackup: await setting('lastBackup', ''),
       lastSync: await setting('lastSync', ''),
       samplesAdded: (await db.cards.bulkGet(sampleCardIds)).every(Boolean),
+      sampleCount: await countSampleCards(),
     }),
     [],
   );
@@ -444,22 +445,47 @@ export function Settings({
         <section className="panel">
           <h2>Test cards</h2>
           <p>Add 12 fictional cards with generated front and back photos.</p>
-          <button
-            disabled={busy || !prefs || prefs.samplesAdded}
-            onClick={() => {
-              setBusy(true);
-              void addSampleCards()
-                .then((count) =>
-                  onMessage(
-                    `${count} test cards added. Their artwork and card details are fictional.`,
-                  ),
-                )
-                .catch((e) => onError(friendlyError(e)))
-                .finally(() => setBusy(false));
-            }}
-          >
-            {prefs?.samplesAdded ? 'Test cards already added' : 'Add test cards'}
-          </button>
+          {prefs && (
+            <p className="small muted">
+              {prefs.sampleCount} test {prefs.sampleCount === 1 ? 'card' : 'cards'} in your
+              collection or archive. Removed cards and photos can be restored from Recently deleted.
+            </p>
+          )}
+          <div className="button-row">
+            <button
+              disabled={busy || !prefs || prefs.samplesAdded}
+              onClick={() => {
+                setBusy(true);
+                void addSampleCards()
+                  .then((count) =>
+                    onMessage(
+                      `${count} test cards added. Their artwork and card details are fictional.`,
+                    ),
+                  )
+                  .catch((e) => onError(friendlyError(e)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              {prefs?.samplesAdded ? 'Test cards already added' : 'Add test cards'}
+            </button>
+            <button
+              className="danger-text"
+              disabled={busy || !prefs?.sampleCount}
+              onClick={() => {
+                setBusy(true);
+                void removeSampleCards()
+                  .then((count) =>
+                    onMessage(
+                      `${count} test ${count === 1 ? 'card' : 'cards'} moved to Recently deleted.`,
+                    ),
+                  )
+                  .catch((e) => onError(friendlyError(e)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              Remove test cards
+            </button>
+          </div>
         </section>
       </div>
     </>

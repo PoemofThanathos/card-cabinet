@@ -57,6 +57,62 @@ test('set grid, all-card list and player grid with persistent test cards', async
   await page.getByRole('button', { name: 'Save file', exact: true }).click();
   await (await downloaded).saveAs(testInfo.outputPath('test-cards.cardcabinet.zip'));
 });
+test('removes test cards and archived copies from Settings, with photos available to restore', async ({
+  page,
+}, testInfo) => {
+  await page.goto('./');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Remove test cards', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Add test cards', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Remove test cards', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: /^All cards/ }).click();
+  await page.getByRole('button', { name: 'Open Shohei Ohtani', exact: true }).first().click();
+  await page.getByRole('button', { name: 'Duplicate physical copy' }).click();
+  await page.getByRole('button', { name: 'Archive', exact: true }).click();
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByRole('button', { name: 'Add a card', exact: true }).click();
+  await page.getByLabel('Player or character', { exact: true }).fill('Real collection card');
+  await page.getByText('Visible features, notes and storage', { exact: true }).click();
+  await page.getByLabel('Tags', { exact: true }).fill('test-card');
+  await page.getByRole('button', { name: 'Save card', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByText(/13 test cards in your collection or archive/)).toBeVisible();
+  await page.getByRole('button', { name: 'Remove test cards', exact: true }).click();
+  await expect(
+    page.getByText('13 test cards moved to Recently deleted.', { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Remove test cards', exact: true })).toBeDisabled();
+  await expect(
+    page.getByRole('button', { name: 'Test cards already added', exact: true }),
+  ).toBeDisabled();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+  await page.screenshot({
+    path: testInfo.outputPath('removed-test-cards-settings.png'),
+    fullPage: true,
+  });
+  await page.getByRole('button', { name: /^All cards/ }).click();
+  await expect(page.locator('.collection-card')).toHaveCount(1);
+  await expect(
+    page.getByRole('button', { name: 'Open Real collection card', exact: true }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: /Recently deleted/ }).click();
+  await expect(page.locator('.collection-card')).toHaveCount(13);
+  await page.getByRole('button', { name: 'Open Shohei Ohtani', exact: true }).first().click();
+  await expect(
+    page.getByRole('img', { name: 'front of Shohei Ohtani', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('img', { name: 'back of Shohei Ohtani', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Restore to collection' }).click();
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByRole('button', { name: /^All cards/ }).click();
+  await expect(page.locator('.collection-card')).toHaveCount(2);
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByText(/1 test card in your collection or archive/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Remove test cards', exact: true })).toBeEnabled();
+});
+
 test('manual collection, Unicode, duplicates, recovery and offline reopen', async ({
   page,
   context,

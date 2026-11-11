@@ -1,4 +1,4 @@
-import { db, makePhoto, saveCard, type CabinetDB, type Photo } from './db';
+import { changeStatus, db, makePhoto, saveCard, type CabinetDB, type Photo } from './db';
 import { newCard, type Card } from './model';
 
 const people = {
@@ -70,6 +70,32 @@ export const sampleCardIds = sets.flatMap((_, setIndex) =>
     (index) => `cab1cab1-0000-4000-8000-${String(setIndex * 2 + index + 1).padStart(12, '0')}`,
   ),
 );
+const sampleIdSet = new Set(sampleCardIds);
+const sampleNote =
+  'Fictional test card with generated artwork. Set, year and card number are sample data, not a real card identification.';
+
+export function isSampleCard(card: Card): boolean {
+  return (
+    sampleIdSet.has(card.id) ||
+    (card.fields.notes === sampleNote && card.fields.tags.split(/[,\s]+/).includes('test-card'))
+  );
+}
+
+export async function countSampleCards(database: CabinetDB = db): Promise<number> {
+  return database.cards.where('status').anyOf('active', 'archived').filter(isSampleCard).count();
+}
+
+export async function removeSampleCards(database: CabinetDB = db): Promise<number> {
+  return database.transaction('rw', database.cards, database.photos, database.queue, async () => {
+    const cards = await database.cards
+      .where('status')
+      .anyOf('active', 'archived')
+      .filter(isSampleCard)
+      .toArray();
+    for (const card of cards) await changeStatus(card, 'deleted', database);
+    return cards.length;
+  });
+}
 
 export function sampleCards(): Card[] {
   return sets.flatMap((set, setIndex) =>
@@ -87,8 +113,7 @@ export function sampleCards(): Card[] {
         cardNumber: `TEST-${String(index + 1).padStart(3, '0')}`,
         language: 'Japanese / English',
         tags: 'test-card',
-        notes:
-          'Fictional test card with generated artwork. Set, year and card number are sample data, not a real card identification.',
+        notes: sampleNote,
       });
       return card;
     }),

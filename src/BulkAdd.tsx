@@ -2,7 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Modal } from './components';
 import { db, friendlyError } from './db';
 import { type Field, categories, fieldLabels, products } from './model';
-import { transformPhoto, fullCrop } from './photos';
+import { PairPreview } from './PhotoPreview';
+import { AiPhotoMatch } from './AiPhotoMatch';
+import {
+  consumePhotoMatchingPairs,
+  getPhotoMatchingJob,
+  type PhotoMatchingJob,
+} from './photo-matching';
 import {
   type BulkEntryPlan,
   type OwnershipMode,
@@ -25,64 +31,6 @@ import {
   deleteBulkEntryPlan,
 } from './bulk-entry';
 import './bulk.css';
-
-function PairPreview({
-  sources,
-  files,
-}: {
-  sources: [FileReference, FileReference];
-  files: Map<string, File>;
-}) {
-  const [urls, setUrls] = useState<string[]>([]),
-    [error, setError] = useState('');
-  useEffect(() => {
-    let cancelled = false;
-    const created: string[] = [];
-    setUrls([]);
-    setError('');
-    void (async () => {
-      for (const source of sources) {
-        const file = files.get(fileKey(source));
-        if (!file) {
-          created.push('');
-          continue;
-        }
-        const photo = await transformPhoto(file, 0, fullCrop, 480);
-        if (cancelled) return;
-        created.push(URL.createObjectURL(photo));
-      }
-      if (!cancelled) setUrls([...created]);
-    })().catch((e) => {
-      if (!cancelled) setError(friendlyError(e));
-    });
-    return () => {
-      cancelled = true;
-      created.filter(Boolean).forEach(URL.revokeObjectURL);
-    };
-  }, [sources, files]);
-  return (
-    <>
-      <div className="bulk-photo-pair">
-        {sources.map((source, i) => (
-          <figure key={i}>
-            {urls[i] ? (
-              <img src={urls[i]} alt={i ? 'Selected back photo' : 'Selected front photo'} />
-            ) : (
-              <div className="bulk-photo-placeholder">
-                {files.has(fileKey(source)) ? 'Loading preview…' : 'Reselect photo'}
-              </div>
-            )}
-            <figcaption>
-              <strong>{i ? 'Back' : 'Front'}</strong>
-              <span>{source.name}</span>
-            </figcaption>
-          </figure>
-        ))}
-      </div>
-      {error && <p className="notice warning">{error}</p>}
-    </>
-  );
-}
 
 export function BulkAdd({
   onClose,
@@ -108,20 +56,23 @@ export function BulkAdd({
   const [busy, setBusy] = useState(false),
     [error, setError] = useState(''),
     [page, setPage] = useState(0);
+  const [aiMode, setAiMode] = useState(false),
+    [hasAiDraft, setHasAiDraft] = useState(false);
   const paused = useRef(false),
     closeAfter = useRef(false),
     active = useRef(true);
   const fileMap = useMemo(() => new Map(files.map((file) => [fileKey(file), file])), [files]);
   useEffect(() => {
     active.current = true;
-    void getBulkEntryPlan()
-      .then((saved) => {
+    void Promise.all([getBulkEntryPlan(), getPhotoMatchingJob()])
+      .then(([saved, matching]) => {
         if (!active.current) return;
         if (saved) {
           setPlan(saved);
           setPersisted(true);
           setKind(saved.kind);
         }
+        setHasAiDraft(Boolean(matching));
       })
       .catch((e) => setError(friendlyError(e)))
       .finally(() => setLoading(false));
@@ -210,7 +161,7 @@ export function BulkAdd({
       if (closeAfter.current) onClose();
     }
   }
-  async function save() {
+  async function save(identify = false) {
     if (!plan) return;
     setBusy(true);
     setError('');
@@ -239,6 +190,8 @@ export function BulkAdd({
         }
         if (active.current) setPlan(current);
       }
+      if (identify && active.current && !current.entries.some((entry) => entry.state === 'pending'))
+        await finish(true, current);
     } catch (e) {
       if (active.current)
         setError(
@@ -273,22 +226,66 @@ export function BulkAdd({
       setError(friendlyError(e));
     }
   }
-  async function finish(identify: boolean) {
-    if (!plan || busy) return;
+  async function finish(identify: boolean, completedPlan?: BulkEntryPlan) {
+    const finished = completedPlan ?? plan;
+    if (!finished || (busy && !completedPlan)) return;
     try {
-      let ids = saved;
-      if (persisted)
+      let ids = savedEntryIds(finished);
+      if (persisted || completedPlan)
         await db.transaction('rw', db.settings, async () => {
           const latest = await getBulkEntryPlan();
-          if (latest?.id !== plan.id)
+          if (latest?.id !== finished.id)
             throw new Error('This import changed in another tab. Reopen Bulk add.');
           ids = savedEntryIds(latest);
-          await deleteBulkEntryPlan(plan.id);
+          await deleteBulkEntryPlan(finished.id);
         });
       onSaved(ids, identify);
     } catch (e) {
       setError(friendlyError(e));
     }
+  }
+  async function useAiPairs(pairs: [FileReference, FileReference][], job: PhotoMatchingJob) {
+    const retained = plan?.identifyAfterSaving ? plan.entries : [];
+    const retainedKeys = new Set(retained.flatMap((entry) => entry.sources?.map(fileKey) ?? []));
+    if (pairs.some((pair) => pair.some((source) => retainedKeys.has(fileKey(source)))))
+      throw new Error('These photos are already in this import. Review their existing pairs.');
+    const next: BulkEntryPlan = {
+      id: plan?.id ?? crypto.randomUUID(),
+      kind: 'photos',
+      identifyAfterSaving: true,
+      entries: [
+        ...retained,
+        ...pairs.map((sources) => ({
+          card: bulkCard(plan?.entries[0]?.card.fields ?? common, {}),
+          sources,
+          state: 'pending' as const,
+        })),
+      ],
+    };
+    await db.transaction('rw', db.settings, async () => {
+      const previous = await getBulkEntryPlan();
+      if (
+        previous &&
+        (previous.id !== plan?.id ||
+          previous.entries.some((entry) => entry.state === 'saved' || entry.state === 'existing') ||
+          JSON.stringify(previous) !== JSON.stringify(plan))
+      )
+        throw new Error(
+          'This import changed in another tab. Reopen Bulk add before replacing its pairs.',
+        );
+      await storeBulkEntryPlan(next);
+      await consumePhotoMatchingPairs(job.id, pairs);
+    });
+    setPlan(next);
+    setPersisted(true);
+    setPage(0);
+    setAiMode(false);
+    setError('');
+    const remaining = job.files.length - pairs.length * 2;
+    setHasAiDraft(remaining > 0);
+    setSummary(
+      `${next.entries.length} reviewed pairs. ${remaining ? `${remaining} unmatched ${remaining === 1 ? 'photo remains' : 'photos remain'} in the AI matching draft.` : 'Save these cards to continue to identification.'}`,
+    );
   }
   function close() {
     if (busy) {
@@ -301,7 +298,7 @@ export function BulkAdd({
       {plan ? 'Reselect source photos to resume' : 'Front and back photos'}
       <input
         type="file"
-        accept="image/*"
+        accept="image/*,.heic,.heif"
         multiple
         disabled={busy}
         onChange={(event) => {
@@ -322,7 +319,24 @@ export function BulkAdd({
   return (
     <Modal title="Bulk add" onClose={close} wide>
       <div className="bulk-add">
-        {loading ? (
+        {aiMode ? (
+          <AiPhotoMatch
+            files={files}
+            sources={
+              plan
+                ? plan.entries
+                    .filter((entry) => entry.state === 'pending')
+                    .flatMap((entry) => entry.sources ?? [])
+                : files.map(fileReference)
+            }
+            onFiles={setFiles}
+            onBack={() => {
+              setAiMode(false);
+              void getPhotoMatchingJob().then((job) => setHasAiDraft(Boolean(job)));
+            }}
+            onUsePairs={useAiPairs}
+          />
+        ) : loading ? (
           <p>Loading saved import…</p>
         ) : !plan ? (
           <>
@@ -471,6 +485,14 @@ export function BulkAdd({
               <button className="primary" disabled={busy} onClick={() => void preview()}>
                 {busy ? 'Preparing…' : 'Review import'}
               </button>
+              {kind === 'photos' && (
+                <button
+                  disabled={busy || (!files.length && !hasAiDraft)}
+                  onClick={() => setAiMode(true)}
+                >
+                  {hasAiDraft ? 'Resume AI photo matching' : 'Match and identify with AI'}
+                </button>
+              )}
               {busy && (
                 <button
                   onClick={() => {
@@ -485,6 +507,16 @@ export function BulkAdd({
         ) : (
           <>
             {summary && <p>{summary}</p>}
+            {plan.kind === 'photos' &&
+              saved.length === 0 &&
+              existing === 0 &&
+              (!plan.identifyAfterSaving || hasAiDraft) && (
+                <div className="button-row">
+                  <button disabled={busy} onClick={() => setAiMode(true)}>
+                    {hasAiDraft ? 'Resume AI photo matching' : 'Match and identify with AI'}
+                  </button>
+                </div>
+              )}
             <p role="status">
               {saved.length} saved · {existing} already owned · {pending} left to save
             </p>
@@ -567,8 +599,15 @@ export function BulkAdd({
                   Pause after this card
                 </button>
               ) : pending > 0 ? (
-                <button className="primary" onClick={() => void save()}>
-                  {persisted ? 'Resume saving' : `Save ${pending} cards`}
+                <button
+                  className="primary"
+                  onClick={() => void save(Boolean(plan.identifyAfterSaving))}
+                >
+                  {plan.identifyAfterSaving
+                    ? `Save and identify ${pending} cards`
+                    : persisted
+                      ? 'Resume saving'
+                      : `Save ${pending} cards`}
                 </button>
               ) : (
                 <button className="primary" onClick={() => void finish(false)}>
