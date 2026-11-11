@@ -4,7 +4,7 @@
 
 A personal card collection app for iPhone Safari and Windows Edge or Chrome. Manual entry, photos, editing, search and backups work without an account. Firebase metadata sync and OpenAI identification are optional.
 
-The app has no card-count limit or subscription. Device storage and service quotas still apply. Firebase is configured for its owner's account. The Cloudflare Worker is deployed with identification disabled pending API-key setup. No paid API requests were made during development.
+The app has no card-count limit or subscription. Device storage and service quotas still apply. Firebase and the identification Worker are configured for the owner's account. A live scan of one generated front/back test card reached the review screen on 11 November 2026. Automated tests use mocks; live identification uses the owner's API balance.
 
 ## License
 
@@ -84,7 +84,7 @@ Keep at least one verified package outside the browser after adding photos. Brow
 
 ## GitHub Pages
 
-The app is published at [poemofthanathos.github.io/card-cabinet](https://poemofthanathos.github.io/card-cabinet/). The repository is [PoemofThanathos/card-cabinet](https://github.com/PoemofThanathos/card-cabinet), with GitHub Actions selected as the Pages source. Pushes to `main` run the tests, build the app and deploy it. Firebase metadata sync is configured for the owner's account. OpenAI identification remains unconfigured.
+The app is published at [poemofthanathos.github.io/card-cabinet](https://poemofthanathos.github.io/card-cabinet/). The repository is [PoemofThanathos/card-cabinet](https://github.com/PoemofThanathos/card-cabinet), with GitHub Actions selected as the Pages source. Pushes to `main` run the tests, build the app and deploy it. Firebase metadata sync and OpenAI identification are configured for the owner's account.
 
 The setup instructions below are for another owner-controlled copy. They do not grant downstream users rights beyond the license.
 
@@ -148,16 +148,18 @@ Each local edit queues a stable mutation ID and the remote revision it was based
 
 ## Optional OpenAI identification Worker
 
-Identification is off by default. Scans use your OpenAI API balance, including eligible subscription credits claimed by the linked API organization. The app cannot read that balance or guarantee a spending cap. [API credits guide](https://developers.openai.com/api/docs/guides/chatgpt-api-credits)
+Identification is off by default on a new device. Scans use your OpenAI API balance, including eligible subscription credits claimed by the linked API organization. The app cannot read that balance or guarantee a spending cap. [API credits guide](https://developers.openai.com/api/docs/guides/chatgpt-api-credits)
 
-The owner's Worker is deployed at `https://card-cabinet-identify.rousilon666.workers.dev`. It is configured for this app's Firebase owner and GitHub Pages origin, with `AI_ENABLED = "false"`. No OpenAI key has been installed and no live identification request has been made.
+The owner's [Worker](https://card-cabinet-identify.rousilon666.workers.dev) is active on Workers Free, restricted to this app's Firebase owner and GitHub Pages origin. A key for the Card Storage OpenAI project was created through encrypted connector delivery and installed as a Worker secret. Its authorized local copy is in the ignored `worker/.dev.vars` file. It is not part of the frontend or repository.
+
+On 11 November 2026, a Responses API request with `gpt-6-luna` and a signed-in app scan of one generated front/back test card succeeded. The scan produced saved suggestions for review; no suggested fields were applied. This does not establish accuracy on real cards or CPU headroom for large photos. The remaining API balance was not verified. See the [verification record](docs/verification.md) for details.
 
 Cloudflare documents a free Workers offering without a credit card requirement. SQLite Durable Objects are available on Workers Free. If onboarding asks you to upgrade or add a paid service, stop and keep manual entry enabled. Do not choose paid Workers, paid TURN, automatic top-ups or Firebase Blaze. [Workers](https://www.cloudflare.com/products/workers/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
 
 1. Create or use your Cloudflare account on Workers Free when you choose to provision it.
 2. Edit the public values in `worker/wrangler.toml`. Set `FIREBASE_PROJECT_ID`, `OWNER_UID` and `ALLOWED_ORIGIN`. For project Pages, the origin is `https://YOUR_USERNAME.github.io`, without the project path. Keep `AI_ENABLED = "false"` initially.
 3. Run `npx wrangler login` yourself, then `npm run worker:deploy`. This provisions the Worker and its SQLite Durable Object. It is a deployment action, not part of local setup.
-4. Enter your OpenAI key through the secret prompt below. Type or paste it into that local prompt yourself. Do not put the key in chat, a command argument or any file.
+4. Enter your OpenAI key through the secret prompt below. Type or paste it into that local prompt yourself. Do not put the key in chat, a command argument, a tracked file or a frontend variable. Keep any local development copy only in the ignored `worker/.dev.vars` file, outside backups and screenshots.
 
 ```powershell
 npx wrangler secret put OPENAI_API_KEY --config worker/wrangler.toml

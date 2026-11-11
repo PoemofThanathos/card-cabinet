@@ -1,6 +1,6 @@
 # Verification record
 
-Updated 10 November 2026. Tests use generated fixtures, fake credentials, mocks and the local Firestore emulator. No real card photos or paid OpenAI calls were used.
+Updated 11 November 2026. Automated tests use generated fixtures, fake credentials, mocks and the local Firestore emulator. Authorized live API checks are recorded separately below.
 
 ## Implemented
 
@@ -22,9 +22,9 @@ Updated 10 November 2026. Tests use generated fixtures, fake credentials, mocks 
 
 ## Automated checks
 
-The current source revision passed **89 unit/integration tests, all 16 browser checks across Chromium and WebKit, and the TypeScript/Vite build**. The build and browser tests use the `/card-cabinet/` project subpath. Mobile screenshots were reviewed. Browser tests use isolated local collections and mocked identification results.
+The 10 November source revision passed **89 unit/integration tests, all 16 browser checks across Chromium and WebKit, and the TypeScript/Vite build**. These formal test counts are unchanged by the 11 November credential setup and live checks. The build and browser tests use the `/card-cabinet/` project subpath. Mobile screenshots were reviewed. Browser tests use isolated local collections and mocked identification results.
 
-The earlier collection-view revision passed 50 unit/integration tests and 8 Chromium/WebKit browser tests. The earlier implementation also passed 5 Firestore emulator tests, a fresh `npm ci` and a Wrangler deployment dry run. Firestore rules and dependencies are unchanged by the current revision. The Worker changed and was deployed with identification disabled, as recorded below.
+The earlier collection-view revision passed 50 unit/integration tests and 8 Chromium/WebKit browser tests. The earlier implementation also passed 5 Firestore emulator tests, a fresh `npm ci` and a Wrangler deployment dry run. Firestore rules and dependencies are unchanged by the credential setup. The Worker is now active, as recorded below.
 
 The checks cover:
 
@@ -61,25 +61,33 @@ On 10 November 2026, the owner signed in to the published app and confirmed link
 
 ## Worker deployment
 
-The Worker is deployed on Workers Free at [card-cabinet-identify.rousilon666.workers.dev](https://card-cabinet-identify.rousilon666.workers.dev). It has `AI_ENABLED=false` and no OpenAI key. No paid identification request was made.
+On 11 November 2026, a key for the Card Storage OpenAI project was created through encrypted connector delivery. The authorized local copy is in the ignored `worker/.dev.vars` file; the deployed copy is a Worker secret. The key is excluded from frontend code, GitHub, backups and screenshots. An authenticated Responses API request asking `gpt-6-luna` for a haiku succeeded. This confirms API access, not the remaining account balance.
+
+The Worker is active on Workers Free at [card-cabinet-identify.rousilon666.workers.dev](https://card-cabinet-identify.rousilon666.workers.dev), with `AI_ENABLED=true`. The deployed version is `96c69f33-44c0-4b55-beb2-36fad3c5db8e`.
 
 Live HTTP checks returned:
 
-| Request                            | Observed response                              |
-| ---------------------------------- | ---------------------------------------------- |
-| Allowed-origin `OPTIONS /identify` | HTTP 204 with the configured CORS origin       |
-| Allowed-origin `POST /identify`    | HTTP 503, identification disabled              |
-| Wrong-origin request               | HTTP 403 without an allowed-origin CORS header |
-| `GET /identify`                    | HTTP 405                                       |
-| Unknown path                       | HTTP 404                                       |
+| Request                                               | Observed response                              |
+| ----------------------------------------------------- | ---------------------------------------------- |
+| Allowed-origin `OPTIONS /identify`                    | HTTP 204 with the configured CORS origin       |
+| Allowed-origin `POST /identify` without authorization | HTTP 401, authentication required              |
+| Wrong-origin request                                  | HTTP 403 without an allowed-origin CORS header |
+| `GET /identify`                                       | HTTP 405                                       |
+| Unknown path                                          | HTTP 404                                       |
 
-These checks verify routing, CORS and the deployed off switch. They do not exercise live Firebase token validation, image parsing, Durable Object reservations or OpenAI responses. Those paths have local tests with mocks, but the deployed authenticated image path and its Workers Free CPU budget still need an approved live check.
+These checks verify routing, CORS and rejection of unauthenticated requests on the active Worker.
+
+The signed-in owner then scanned one generated Shohei Ohtani test card through the published app in Brave, sending its front and back together. The queue finished with 1 of 1 processed and zero failures. The device attempt count increased from zero to one. The saved review remained available after closing and reopening it.
+
+Suggestions included the English and Japanese names, `大谷翔平`, BBM, 2024 and `TEST-001`, with evidence from both sides. The model recognized the back's printed warning that this was a fictional test card and left the unknown team blank. Every suggestion checkbox remained unselected, and no suggested fields were applied. A separate test copy and its saved review were retained. Existing records were unchanged, and this check did not run metadata sync.
+
+This one generated fixture exercised Firebase authentication, Worker image validation, Durable Object accounting, the live OpenAI response and saved review. It does not establish accuracy on real cards, performance on large camera photos or sustained batch reliability.
 
 ## Not verified by these checks
 
 Live sync between two physical devices and account-specific quota behavior remain unverified.
 
-No real OpenAI identification was requested. The owner still needs to configure the Worker secret and approve enabling identification. Provider access, actual image-identification quality, service quota behavior and CPU headroom remain unverified. The disabled Worker smoke checks and mocked calls cannot establish these production behaviors.
+API access and one generated-card scan are verified. Real-card identification accuracy, account-specific quota behavior and Workers Free CPU headroom for large photos remain unverified. A successful request does not establish a remaining credit balance or reliable operation at higher volume.
 
 No physical iPhone was available. Camera permissions, HEIC decoding, EXIF orientation on actual camera files, Home Screen installation, offline reopening, updates, Files export and phone memory limits remain on the [manual checklist](device-checklist.md). Playwright WebKit is not an iPhone test.
 
