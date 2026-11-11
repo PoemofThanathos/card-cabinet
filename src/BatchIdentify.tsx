@@ -4,6 +4,7 @@ import { type Card, title } from './model';
 import { db, friendlyError, setting } from './db';
 import { Modal } from './components';
 import { SuggestionReview } from './Editor';
+import { SpeedControl, useProcessingSpeed } from './SpeedControl';
 import { readIdentificationOptions } from './ai';
 import { identificationLabel, normalizeIdentificationOptions } from './ai-options';
 import {
@@ -16,6 +17,18 @@ import {
   type BatchReview,
   type IdentificationBatch,
 } from './batch';
+
+function reviewTitle(review: BatchReview) {
+  if (title(review.card) !== 'Untitled card') return title(review.card);
+  return (
+    review.result.suggestions.find(
+      (suggestion) =>
+        (suggestion.field === 'name' || suggestion.field === 'japaneseName') &&
+        !suggestion.uncertain &&
+        suggestion.value,
+    )?.value || title(review.card)
+  );
+}
 
 export function BatchIdentify({
   cards,
@@ -50,6 +63,7 @@ export function BatchIdentify({
     [activity, setActivity] = useState<BatchActivity>({ phase: 'idle' }),
     [review, setReview] = useState<{ key: string; value: BatchReview } | null>(null),
     [failurePage, setFailurePage] = useState(0);
+  const [speed, setSpeed, speedReady] = useProcessingSpeed(setError);
   const controller = useRef<AbortController | null>(null);
   const mounted = useRef(true);
   const closeWhenPaused = useRef(false);
@@ -65,7 +79,7 @@ export function BatchIdentify({
   }, [page, reviewCount]);
 
   async function start(replace: boolean) {
-    if (busy) return;
+    if (busy || !speedReady) return;
     setBusy(true);
     setPausing(false);
     setError('');
@@ -75,12 +89,13 @@ export function BatchIdentify({
       const job = replace
         ? await createBatch(
             cards.map((card) => card.id),
-            { identificationOptions: chosenOptions },
+            { identificationOptions: chosenOptions, speed },
           )
         : batch;
       if (!job) throw new Error('No saved batch is available.');
       setSavedView(true);
       const finished = await runBatch(job.id, {
+        speed,
         signal: controller.current.signal,
         onActivity: (value) => {
           if (mounted.current) setActivity(value);
@@ -137,7 +152,10 @@ export function BatchIdentify({
     }
   }
   const pending = batch
-    ? Math.max(0, batch.cardIds.length - batch.position - (batch.processing ? 1 : 0))
+    ? Math.max(
+        0,
+        batch.cardIds.length - (batch.nextPosition ?? batch.position + (batch.processing ? 1 : 0)),
+      )
     : 0;
   return (
     <Modal title="Batch identification" onClose={close} wide>
@@ -145,7 +163,7 @@ export function BatchIdentify({
         <>
           <p>
             This batch contains <strong>{cards.length}</strong> cards. Starting it sends both photos
-            of each card to your Worker and OpenAI, one card at a time, using your API balance.
+            of each card to your Worker and OpenAI using your API balance.
           </p>
           <p>Keep this app open while it runs. Review the suggestions before applying fields.</p>
           {chosenOptions && (
@@ -154,6 +172,7 @@ export function BatchIdentify({
               or change Settings.
             </p>
           )}
+          <SpeedControl value={speed} onChange={setSpeed} disabled={busy || !speedReady} ai />
           <ol>
             {cards.slice(0, 8).map((card) => (
               <li key={card.id}>
@@ -172,7 +191,7 @@ export function BatchIdentify({
           <div className="button-row">
             <button
               className="primary"
-              disabled={busy || batch === undefined || !chosenOptions}
+              disabled={busy || batch === undefined || !chosenOptions || !speedReady}
               onClick={() => void start(true)}
             >
               {batch ? 'Replace queue and start ' : 'Start identification of '}
@@ -207,10 +226,10 @@ export function BatchIdentify({
             <>
               <p role="status">
                 {pausing
-                  ? 'Pausing after the current card finishes…'
+                  ? 'Pausing after active requests finish…'
                   : activity.phase === 'waiting'
                     ? 'Waiting before the next scan…'
-                    : 'Identifying the next card…'}
+                    : `Identifying cards · ${batch.inFlight?.length ?? 1} active requests…`}
               </p>
               <button disabled={pausing} onClick={() => pause()}>
                 Pause batch
@@ -220,9 +239,9 @@ export function BatchIdentify({
             <>
               {batch.processing && (
                 <p className="notice warning">
-                  A scan was in progress. If another tab is running, pause it there. After an
+                  Requests were in progress. If another tab is running, pause it there. After an
                   interruption, its outcome is unknown and it may have used API credit. Continuing
-                  skips that card and waits for its server reservation to expire.
+                  skips those requests and waits for its server reservation to expire.
                 </p>
               )}
               {pending > 0 ? (
@@ -231,7 +250,17 @@ export function BatchIdentify({
                     Continue automatically with {pending} remaining cards. Each sends two photos and
                     uses your API balance.
                   </p>
-                  <button className="primary" onClick={() => void start(false)}>
+                  <SpeedControl
+                    value={speed}
+                    onChange={setSpeed}
+                    disabled={busy || !speedReady}
+                    ai
+                  />
+                  <button
+                    className="primary"
+                    disabled={!speedReady}
+                    onClick={() => void start(false)}
+                  >
                     Continue {pending} remaining cards
                   </button>
                 </>
@@ -303,14 +332,14 @@ export function BatchIdentify({
                 <li key={row.key}>
                   <div className="button-row">
                     <button disabled={applying} onClick={() => setReview({ key: row.key, value })}>
-                      Review {title(value.card)}
+                      Review {reviewTitle(value)}
                       {value.card.fields.cardNumber ? ' · #' + value.card.fields.cardNumber : ''}
                     </button>
                     <button
                       disabled={applying}
                       aria-label={
                         'Discard suggestions for ' +
-                        title(value.card) +
+                        reviewTitle(value) +
                         (value.card.fields.cardNumber ? ' #' + value.card.fields.cardNumber : '')
                       }
                       onClick={() => void discard(row.key)}
@@ -318,6 +347,9 @@ export function BatchIdentify({
                       Discard
                     </button>
                   </div>
+                  {value.card.fields.notes && (
+                    <p className="small muted">{value.card.fields.notes}</p>
+                  )}
                 </li>
               );
             })}

@@ -1,6 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Dexie from 'dexie';
-import { CabinetDB, saveCard, setSetting, setting } from '../src/db';
+import {
+  CabinetDB,
+  changeStatus,
+  purgeDeletedCards,
+  saveCard,
+  setSetting,
+  setting,
+} from '../src/db';
+import { type ProcessingSpeed } from '../src/processing-speed';
+import {
+  createPhotoMatchingJob,
+  deletePhotoMatchingJob,
+  photoMatchingKey,
+} from '../src/photo-matching';
+import { fileKey } from '../src/bulk-entry';
 import { newCard, plainCard, type Suggestions, type Card } from '../src/model';
 import {
   aiLeaseMs,
@@ -73,6 +87,283 @@ async function cards(count: number) {
   return result;
 }
 const reviewKeys = () => database.settings.where('key').startsWith(reviewPrefix).primaryKeys();
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+describe('parallel batch speeds', () => {
+  it('waits out a discarded matching request before switching to Ultra fast identification', async () => {
+    const [card] = await cards(1);
+    const sources = [
+      { name: 'front.jpg', size: 4, lastModified: 1 },
+      { name: 'back.jpg', size: 4, lastModified: 1 },
+    ];
+    const matching = await createPhotoMatchingJob(sources, defaultIdentificationOptions, {
+      ...options(),
+      speed: 'fast',
+    });
+    await setSetting(photoMatchingKey, { ...matching, processing: sources.map(fileKey) }, database);
+    const interruptedAt = clock;
+    await deletePhotoMatchingJob(matching.id, options());
+    const job = await createBatch([card.id], { ...options(), speed: 'ultra' });
+    await runBatch(job.id, {
+      ...options(),
+      identifyCard: async () => {
+        expect(clock - interruptedAt).toBeGreaterThanOrEqual(aiLeaseMs);
+        return suggestions;
+      },
+    });
+  });
+  it.each([
+    ['fast', 2],
+    ['ultra', 4],
+  ] as const)(
+    'limits %s to %i requests and saves out-of-order results by card',
+    async (speed, concurrency) => {
+      const selected = await cards(7);
+      const job = await createBatch(
+        selected.map((card) => card.id),
+        { ...options(), speed },
+      );
+      const pending: { card: Card; response: ReturnType<typeof deferred<Suggestions>> }[] = [];
+      let active = 0,
+        peak = 0;
+      const identifyCard = vi.fn(
+        async (card: Card, _choice?: IdentificationOptions, actualSpeed?: ProcessingSpeed) => {
+          expect(actualSpeed).toBe(speed);
+          const response = deferred<Suggestions>();
+          pending.push({ card, response });
+          peak = Math.max(peak, ++active);
+          try {
+            return await response.promise;
+          } finally {
+            active--;
+          }
+        },
+      );
+      const wait = vi.fn(options().wait);
+      const finished = runBatch(job.id, { ...options(), wait, identifyCard });
+      for (let start = 0; start < selected.length; start += concurrency) {
+        const end = Math.min(start + concurrency, selected.length);
+        await vi.waitFor(() => expect(pending).toHaveLength(end));
+        const checkpoint = await setting<IdentificationBatch | null>(batchKey, null, database);
+        expect(checkpoint?.nextPosition).toBe(end);
+        expect(checkpoint?.inFlight).toHaveLength(end - start);
+        for (let index = end - 1; index >= start; index--) {
+          const result = structuredClone(suggestions);
+          result.suggestions[0].value = 'Player ' + pending[index].card.fields.cardNumber;
+          pending[index].response.resolve(result);
+          await vi.waitFor(async () =>
+            expect(
+              await database.settings.get(reviewPrefix + job.id + ':' + pending[index].card.id),
+            ).toBeDefined(),
+          );
+        }
+      }
+      const result = await finished;
+      expect(peak).toBe(concurrency);
+      expect(wait).not.toHaveBeenCalled();
+      expect(result.position).toBe(7);
+      expect(result.nextPosition).toBe(7);
+      expect(result.inFlight).toEqual([]);
+      expect(result.status).toBe('complete');
+      for (const card of selected) {
+        const review = await setting<BatchReview | null>(
+          reviewPrefix + job.id + ':' + card.id,
+          null,
+          database,
+        );
+        expect(review?.result.suggestions[0].value).toBe('Player ' + card.fields.cardNumber);
+      }
+    },
+  );
+
+  it('stops launches after a failed parallel request and saves its still-running peer', async () => {
+    const selected = await cards(5);
+    const job = await createBatch(
+      selected.map((card) => card.id),
+      { ...options(), speed: 'fast' },
+    );
+    const responses = [deferred<Suggestions>(), deferred<Suggestions>()];
+    let called = 0;
+    const running = runBatch(job.id, {
+      ...options(),
+      identifyCard: async () => responses[called++].promise,
+    });
+    await vi.waitFor(() => expect(called).toBe(2));
+    responses[1].reject(new Error('API unavailable'));
+    await vi.waitFor(async () =>
+      expect(
+        (await setting<IdentificationBatch | null>(batchKey, null, database))?.failures,
+      ).toHaveLength(1),
+    );
+    expect(called).toBe(2);
+    responses[0].resolve(suggestions);
+    const paused = await running;
+    expect(paused.status).toBe('paused');
+    expect(paused.position).toBe(2);
+    expect(await reviewKeys()).toHaveLength(1);
+    const next = vi.fn(async (_card: Card) => suggestions);
+    const complete = await runBatch(job.id, { ...options(), identifyCard: next });
+    expect(next.mock.calls.map(([card]) => card.id)).toEqual(
+      selected.slice(2).map((card) => card.id),
+    );
+    expect(complete.position).toBe(5);
+    expect(await reviewKeys()).toHaveLength(4);
+  });
+
+  it('pauses after all four active requests finish and resumes at a different speed', async () => {
+    const selected = await cards(6);
+    const job = await createBatch(
+      selected.map((card) => card.id),
+      { ...options(), speed: 'ultra' },
+    );
+    const control = new AbortController();
+    const responses = Array.from({ length: 4 }, () => deferred<Suggestions>());
+    let called = 0;
+    const running = runBatch(job.id, {
+      ...options(),
+      signal: control.signal,
+      identifyCard: async () => responses[called++].promise,
+    });
+    await vi.waitFor(() => expect(called).toBe(4));
+    control.abort();
+    for (const response of responses.toReversed()) response.resolve(suggestions);
+    const paused = await running;
+    expect(paused.status).toBe('paused');
+    expect(paused.position).toBe(4);
+    expect(paused.inFlight).toEqual([]);
+    const started: number[] = [];
+    const next = vi.fn(
+      async (_card: Card, _choice?: IdentificationOptions, speed?: ProcessingSpeed) => {
+        expect(speed).toBe('normal');
+        started.push(clock);
+        return suggestions;
+      },
+    );
+    const finished = await runBatch(job.id, { ...options(), speed: 'normal', identifyCard: next });
+    expect(next).toHaveBeenCalledTimes(2);
+    expect(started[1] - started[0]).toBeGreaterThanOrEqual(15000);
+    expect(finished.speed).toBe('normal');
+    expect(await reviewKeys()).toHaveLength(6);
+  });
+
+  it('recovers every unfinished parallel request without replaying completed or unknown requests', async () => {
+    const selected = await cards(6);
+    const job = await createBatch(
+      selected.map((card) => card.id),
+      { ...options(), speed: 'ultra' },
+    );
+    await setSetting(
+      reviewPrefix + job.id + ':' + selected[2].id,
+      { batchId: job.id, card: selected[2], result: suggestions },
+      database,
+    );
+    await setSetting(
+      batchKey,
+      {
+        ...job,
+        position: 1,
+        nextPosition: 4,
+        status: 'running',
+        processing: selected[0].id,
+        inFlight: [0, 1, 3].map((index) => ({
+          cardId: selected[index].id,
+          index,
+          startedAt: clock,
+        })),
+      },
+      database,
+    );
+    const recoveredAt = clock;
+    const next = vi.fn(async (_card: Card) => {
+      expect(clock - recoveredAt).toBeGreaterThanOrEqual(aiLeaseMs);
+      return suggestions;
+    });
+    const result = await runBatch(job.id, { ...options(), speed: 'fast', identifyCard: next });
+    expect(next.mock.calls.map(([card]) => card.id)).toEqual(
+      selected.slice(4).map((card) => card.id),
+    );
+    expect(result.position).toBe(6);
+    expect(result.failures.map((failure) => failure.cardId)).toEqual(
+      [0, 1, 3].map((index) => selected[index].id),
+    );
+    expect(result.failures.every((failure) => failure.error.includes('not retried'))).toBe(true);
+    expect(await reviewKeys()).toHaveLength(3);
+  });
+
+  it('retains completed peers when one parallel result cannot be stored', async () => {
+    const selected = await cards(3);
+    const job = await createBatch(
+      selected.map((card) => card.id),
+      { ...options(), speed: 'fast' },
+    );
+    const original = database.settings.put.bind(database.settings);
+    const put = vi
+      .spyOn(database.settings, 'put')
+      .mockImplementation((row) =>
+        row.key === reviewPrefix + job.id + ':' + selected[0].id
+          ? Dexie.Promise.reject(new Error('Storage full'))
+          : original(row),
+      );
+    const responses = [deferred<Suggestions>(), deferred<Suggestions>()];
+    let called = 0;
+    const running = runBatch(job.id, {
+      ...options(),
+      identifyCard: async () => responses[called++].promise,
+    });
+    const failed = expect(running).rejects.toThrow('Storage full');
+    await vi.waitFor(() => expect(called).toBe(2));
+    responses[1].resolve(suggestions);
+    await vi.waitFor(async () => expect(await reviewKeys()).toHaveLength(1));
+    responses[0].resolve(suggestions);
+    await failed;
+    const saved = await setting<IdentificationBatch | null>(batchKey, null, database);
+    expect(saved?.inFlight?.map((request) => request.cardId)).toEqual([selected[0].id]);
+    expect(saved?.position).toBe(1);
+    put.mockRestore();
+    const next = vi.fn(async (_card: Card) => suggestions);
+    await runBatch(job.id, { ...options(), identifyCard: next });
+    expect(next.mock.calls.map(([card]) => card.id)).toEqual([selected[2].id]);
+    expect(await reviewKeys()).toHaveLength(2);
+  });
+
+  it('does not restore a purged card or its suggestions when parallel requests finish', async () => {
+    const selected = await cards(3);
+    const job = await createBatch(
+      selected.map((card) => card.id),
+      { ...options(), speed: 'fast' },
+    );
+    const control = new AbortController();
+    const responses = [deferred<Suggestions>(), deferred<Suggestions>()];
+    let called = 0;
+    const running = runBatch(job.id, {
+      ...options(),
+      signal: control.signal,
+      identifyCard: async () => responses[called++].promise,
+    });
+    await vi.waitFor(() => expect(called).toBe(2));
+    control.abort();
+    await changeStatus(selected[0], 'deleted', database);
+    await purgeDeletedCards([selected[0].id], database);
+    responses[1].resolve(suggestions);
+    responses[0].resolve(suggestions);
+    const paused = await running;
+    expect(paused.position).toBe(2);
+    expect((await database.cards.get(selected[0].id))?.status).toBe('purged');
+    expect(
+      await database.settings.get(reviewPrefix + job.id + ':' + selected[0].id),
+    ).toBeUndefined();
+    expect(await reviewKeys()).toHaveLength(1);
+    expect(paused.failures[0].name).toBe('Permanently deleted card');
+  });
+});
 
 describe('saved identification batches', () => {
   it('refreshes the photo-matching cooldown before resuming an older identification queue', async () => {
@@ -165,12 +456,19 @@ describe('saved identification batches', () => {
     const [card] = await cards(1);
     const job = await createBatch([card.id], options());
     delete job.identificationOptions;
+    delete job.speed;
+    delete job.nextPosition;
+    delete job.inFlight;
+    delete job.notBefore;
     await setSetting(batchKey, job, database);
     await setSetting('aiOptions', { model: 'gpt-6-astra', reasoningEffort: 'high' }, database);
-    const identifyCard = vi.fn(async (_card: Card, choice?: IdentificationOptions) => {
-      expect(choice).toEqual(defaultIdentificationOptions);
-      return suggestions;
-    });
+    const identifyCard = vi.fn(
+      async (_card: Card, choice?: IdentificationOptions, speed?: ProcessingSpeed) => {
+        expect(choice).toEqual(defaultIdentificationOptions);
+        expect(speed).toBe('normal');
+        return suggestions;
+      },
+    );
     const finished = await runBatch(job.id, { ...options(), identifyCard });
     expect(finished.identificationOptions).toEqual(defaultIdentificationOptions);
     const [key] = await reviewKeys();

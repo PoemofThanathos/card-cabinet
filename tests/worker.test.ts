@@ -5,6 +5,7 @@ import worker, {
   validateScan,
   validateImage,
   reserve,
+  releaseReservation,
   limitedJson,
   callOpenAI,
   ScanGate,
@@ -130,6 +131,14 @@ describe('Firebase token verification', () => {
   });
 });
 describe('Worker request boundaries', () => {
+  it('accepts the three processing speeds and rejects invalid speed overrides', () => {
+    const request = { requestId: crypto.randomUUID(), images: [jpeg(), jpeg()] };
+    for (const speed of ['normal', 'fast', 'ultra'])
+      expect(validateScan({ ...request, speed }).speed).toBe(speed);
+    expect(validateScan(request).speed).toBeUndefined();
+    for (const speed of ['unlimited', 4, null, true, {}])
+      expect(() => validateScan({ ...request, speed })).toThrow();
+  });
   it('accepts exactly two clean JPEGs', () => {
     expect(
       validateScan({ requestId: crypto.randomUUID(), images: [jpeg(), jpeg()] }).images,
@@ -225,6 +234,103 @@ describe('Worker request boundaries', () => {
   });
 });
 describe('durable usage limits', () => {
+  it.each([
+    ['fast', 2],
+    ['ultra', 4],
+  ] as const)(
+    'allows %s speed to run %i concurrent requests without weakening replay protection',
+    async (speed, concurrency) => {
+      const { ctx, saved } = durableContext();
+      const replies: ((value: Response) => void)[] = [];
+      const fetcher = vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            replies.push(resolve);
+          }),
+      );
+      vi.stubGlobal('fetch', fetcher);
+      const gate = new ScanGate(ctx, env);
+      const ids = Array.from({ length: concurrency }, () => crypto.randomUUID());
+      const running = ids.map((id) => gate.fetch(scanRequest(id, true, { speed })));
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(concurrency));
+      expect(saved()?.leases).toHaveLength(concurrency);
+      expect((await gate.fetch(scanRequest(crypto.randomUUID(), true, { speed }))).status).toBe(
+        429,
+      );
+      expect((await gate.fetch(scanRequest(ids[0], true, { speed }))).status).toBe(429);
+      expect(saved()?.daily).toBe(concurrency);
+
+      replies[1](completedResponse());
+      expect((await running[1]).status).toBe(200);
+      expect(saved()?.leases?.map((lease) => lease.id)).not.toContain(ids[1]);
+      expect(saved()?.leases?.map((lease) => lease.id)).toContain(ids[0]);
+      const extra = gate.fetch(scanRequest(crypto.randomUUID(), true, { speed }));
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(concurrency + 1));
+      expect(saved()?.leases).toHaveLength(concurrency);
+      expect((await gate.fetch(scanRequest(crypto.randomUUID(), true, { speed }))).status).toBe(
+        429,
+      );
+      for (let index = 0; index < concurrency; index++)
+        if (index !== 1) replies[index](completedResponse());
+      replies[concurrency](completedResponse());
+      expect((await extra).status).toBe(200);
+      expect((await Promise.all(running)).every((response) => response.status === 200)).toBe(true);
+      expect(saved()?.leases).toEqual([]);
+      expect(saved()?.lease).toBeNull();
+      expect(saved()?.daily).toBe(concurrency + 1);
+      expect(
+        (await new ScanGate(ctx, env).fetch(scanRequest(ids[0], true, { speed }))).status,
+      ).toBe(429);
+      expect(fetcher).toHaveBeenCalledTimes(concurrency + 1);
+    },
+  );
+
+  it('keeps a Normal or Fast reservation restrictive when another request selects Ultra fast', () => {
+    const now = Date.UTC(2026, 10, 11);
+    const normal = reserve(undefined, 'normal', now, true).state;
+    expect(reserve(normal, 'ultra', now + 20000, true, 'ultra').error).toContain('running');
+    const first = reserve(undefined, 'fast-1', now, true, 'fast').state;
+    const second = reserve(first, 'fast-2', now, true, 'fast').state;
+    expect(reserve(second, 'ultra', now, true, 'ultra').error).toContain('running');
+    const released = releaseReservation(second, 'fast-1', now);
+    const added = reserve(released, 'ultra', now, true, 'ultra');
+    expect(added.error).toBeUndefined();
+    expect(reserve(added.state, 'extra', now, true, 'ultra').error).toContain('running');
+    const complete = releaseReservation(
+      releaseReservation(added.state, 'fast-2', now),
+      'ultra',
+      now,
+    );
+    expect(reserve(complete, 'normal-again', now + 1000, true).error).toContain('15 seconds');
+  });
+
+  it('migrates the old single lease and never releases a newer request when an expired one completes', () => {
+    const now = Date.UTC(2026, 10, 11);
+    const old = reserve(undefined, 'old', now, true).state;
+    delete old.leases;
+    expect(reserve(old, 'new', now + aiLeaseMs - 1, true, 'ultra').error).toContain('running');
+    const replacement = reserve(old, 'new', now + aiLeaseMs, true, 'ultra').state;
+    const released = releaseReservation(replacement, 'old', now + aiLeaseMs + 1);
+    expect(released.leases?.map((lease) => lease.id)).toEqual(['new']);
+    expect(released.lease).toBe('new');
+  });
+
+  it('keeps daily and monthly caps atomic across faster reservations', () => {
+    const now = Date.UTC(2026, 10, 11, 12);
+    const previous = reserve(undefined, 'old', now - 20000, true, 'ultra').state;
+    previous.daily = 4;
+    previous.monthly = 49;
+    const fifth = reserve(releaseReservation(previous, 'old', now), 'fifth', now, false, 'ultra');
+    expect(fifth.error).toBeUndefined();
+    expect(fifth.state.daily).toBe(5);
+    expect(fifth.state.monthly).toBe(50);
+    const blocked = reserve(fifth.state, 'sixth', now, false, 'ultra');
+    expect(blocked.error).toContain('limit');
+    expect(blocked.state.daily).toBe(5);
+    const uncapped = reserve(fifth.state, 'uncapped', now, true, 'ultra');
+    expect(uncapped.error).toBeUndefined();
+    expect(uncapped.state.daily).toBe(6);
+  });
   it('keeps the reservation through the longer request window and releases expired leases', () => {
     const now = Date.UTC(2026, 10, 11);
     const first = reserve(undefined, crypto.randomUUID(), now).state;
@@ -240,14 +346,19 @@ describe('durable usage limits', () => {
     let result = reserve(undefined, id, now);
     expect(result.state.daily).toBe(1);
     expect(reserve(result.state, crypto.randomUUID(), now + 20000).error).toContain('running');
-    result.state.lease = null;
+    result.state = releaseReservation(result.state, result.state.lease!, now);
     expect(reserve(result.state, crypto.randomUUID(), now + 1000).error).toContain('15 seconds');
     for (let n = 1; n < 5; n++) {
-      result = reserve({ ...result.state, lease: null }, crypto.randomUUID(), now + n * 20000);
+      result = reserve(
+        { ...result.state, lease: null, leases: [] },
+        crypto.randomUUID(),
+        now + n * 20000,
+      );
       expect(result.error).toBeUndefined();
     }
     expect(
-      reserve({ ...result.state, lease: null }, crypto.randomUUID(), now + 200000).error,
+      reserve({ ...result.state, lease: null, leases: [] }, crypto.randomUUID(), now + 200000)
+        .error,
     ).toContain('limit');
   });
   it('unlimited mode bypasses count caps while retaining counts, spacing and the lease', () => {
@@ -256,21 +367,21 @@ describe('durable usage limits', () => {
     previous.daily = 5;
     previous.monthly = 50;
     expect(reserve(previous, crypto.randomUUID(), now + 20000, true).error).toContain('running');
-    previous.lease = null;
+    Object.assign(previous, releaseReservation(previous, previous.lease!, now));
     expect(reserve(previous, crypto.randomUUID(), now + 1000, true).error).toContain('15 seconds');
     const result = reserve(previous, crypto.randomUUID(), now + 20000, true);
     expect(result.error).toBeUndefined();
     expect(result.state.daily).toBe(6);
     expect(result.state.monthly).toBe(51);
     expect(
-      reserve({ ...result.state, lease: null }, crypto.randomUUID(), now + 40000).error,
+      reserve({ ...result.state, lease: null, leases: [] }, crypto.randomUUID(), now + 40000).error,
     ).toContain('limit');
   });
   it('keeps monthly limits across daily resets and resets on a new UTC month', () => {
     const now = Date.UTC(2026, 10, 9);
     const previous = reserve(undefined, crypto.randomUUID(), now).state;
     previous.monthly = 50;
-    previous.lease = null;
+    Object.assign(previous, releaseReservation(previous, previous.lease!, now));
     expect(reserve(previous, crypto.randomUUID(), now + 86400000).error).toContain('limit');
     expect(reserve(previous, crypto.randomUUID(), Date.UTC(2026, 11, 1)).error).toBeUndefined();
   });

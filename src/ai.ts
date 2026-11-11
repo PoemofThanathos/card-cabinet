@@ -3,6 +3,7 @@ import { db, setting, photoBlob, type CabinetDB } from './db';
 import { suggestionSchema, type Card } from './model';
 import { transmittedPhoto } from './photos';
 import { photoAnalysisResultSchema } from './photo-analysis';
+import { normalizeProcessingSpeed, type ProcessingSpeed } from './processing-speed';
 import {
   aiClientTimeoutMs,
   defaultIdentificationOptions,
@@ -31,8 +32,10 @@ async function requestPhotos(
   loadPhotos: () => Promise<Blob[]>,
   options?: IdentificationOptions,
   task?: 'analyze_photos',
+  speed?: ProcessingSpeed,
 ) {
   const chosen = normalizeIdentificationOptions(options ?? (await readIdentificationOptions()));
+  const processingSpeed = normalizeProcessingSpeed(speed);
   const { url, user } = await assertIdentificationReady();
   const day = new Date().toISOString().slice(0, 10);
   const usage = await setting('aiUsage', { day, count: 0 });
@@ -63,6 +66,7 @@ async function requestPhotos(
       requestId: crypto.randomUUID(),
       images,
       unlimited,
+      speed: processingSpeed,
       ...chosen,
       ...(task ? { task } : {}),
     }),
@@ -90,25 +94,38 @@ async function requestPhotos(
   return result;
 }
 
-export async function identify(card: Card, options?: IdentificationOptions) {
+export async function identify(
+  card: Card,
+  options?: IdentificationOptions,
+  speed?: ProcessingSpeed,
+) {
   return suggestionSchema.parse(
-    await requestPhotos(async () => {
-      const front = card.photos.front ? await db.photos.get(card.photos.front) : null;
-      const back = card.photos.back ? await db.photos.get(card.photos.back) : null;
-      if (!front || !back)
-        throw new Error(
-          'Both photos must be available on this device. Save your photos before identifying.',
-        );
-      return [photoBlob(front), photoBlob(back)];
-    }, options),
+    await requestPhotos(
+      async () => {
+        const front = card.photos.front ? await db.photos.get(card.photos.front) : null;
+        const back = card.photos.back ? await db.photos.get(card.photos.back) : null;
+        if (!front || !back)
+          throw new Error(
+            'Both photos must be available on this device. Save your photos before identifying.',
+          );
+        return [photoBlob(front), photoBlob(back)];
+      },
+      options,
+      undefined,
+      speed,
+    ),
   );
 }
 
-export async function analyzePhotos(blobs: Blob[], options: IdentificationOptions) {
+export async function analyzePhotos(
+  blobs: Blob[],
+  options: IdentificationOptions,
+  speed?: ProcessingSpeed,
+) {
   if (blobs.length < 1 || blobs.length > 2)
     throw new Error('Analyze one or two photos per request.');
   const result = photoAnalysisResultSchema.parse(
-    await requestPhotos(async () => blobs, options, 'analyze_photos'),
+    await requestPhotos(async () => blobs, options, 'analyze_photos', speed),
   );
   if (result.photos.length !== blobs.length)
     throw new Error(

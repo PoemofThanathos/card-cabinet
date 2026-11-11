@@ -4,8 +4,10 @@ import { identificationLabel, type IdentificationOptions } from './ai-options';
 import { fileKey, fileReference, validateSourceFiles, type FileReference } from './bulk-entry';
 import { friendlyError } from './db';
 import { PairPreview, PhotoPreview } from './PhotoPreview';
+import { SpeedControl, useProcessingSpeed } from './SpeedControl';
 import {
   createPhotoMatchingJob,
+  analysisPendingFiles,
   getPhotoMatchingJob,
   runPhotoMatchingJob,
   deletePhotoMatchingJob,
@@ -40,6 +42,7 @@ export function AiPhotoMatch({
     [back, setBack] = useState(''),
     [inspect, setInspect] = useState('');
   const [discard, setDiscard] = useState(false);
+  const [speed, setSpeed, speedReady] = useProcessingSpeed(setError);
   const controller = useRef<AbortController | null>(null);
   const mounted = useRef(true),
     backAfter = useRef(false);
@@ -66,7 +69,7 @@ export function AiPhotoMatch({
   }, []);
   const selectedSources = job?.files ?? sources;
   const missing = selectedSources.filter((source) => !fileMap.has(fileKey(source))).length;
-  const missingForAnalysis = (job ? job.files.slice(job.cursor) : sources).some(
+  const missingForAnalysis = (job ? analysisPendingFiles(job) : sources).some(
     (source) => !fileMap.has(fileKey(source)),
   );
   const suggestions = useMemo(
@@ -79,15 +82,16 @@ export function AiPhotoMatch({
   const currentPair = pairs[page];
   const inspected = unmatched.find((source) => fileKey(source) === inspect) ?? unmatched[0];
   async function run() {
-    if (!options || busy) return;
+    if (!options || busy || !speedReady) return;
     setBusy(true);
     setError('');
     backAfter.current = false;
     controller.current = new AbortController();
     try {
-      const current = job ?? (await createPhotoMatchingJob(sources, options));
+      const current = job ?? (await createPhotoMatchingJob(sources, options, { speed }));
       setJob(current);
       const finished = await runPhotoMatchingJob(current.id, fileMap, {
+        speed,
         signal: controller.current.signal,
         onProgress: (next, state) => {
           if (!mounted.current) return;
@@ -190,6 +194,9 @@ export function AiPhotoMatch({
       <p className="small muted">
         {options && identificationLabel(job?.identificationOptions ?? options)}
       </p>
+      {job?.status !== 'complete' && (
+        <SpeedControl value={speed} onChange={setSpeed} disabled={busy || !speedReady} ai />
+      )}
       {!job && (
         <>
           <p>
@@ -402,7 +409,9 @@ export function AiPhotoMatch({
         ) : (
           <button
             className="primary"
-            disabled={busy || missingForAnalysis || !options || !selectedSources.length}
+            disabled={
+              busy || !speedReady || missingForAnalysis || !options || !selectedSources.length
+            }
             onClick={() => void run()}
           >
             {busy

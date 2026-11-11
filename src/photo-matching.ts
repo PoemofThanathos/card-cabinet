@@ -4,7 +4,13 @@ import {
   normalizeIdentificationOptions,
   type IdentificationOptions,
 } from './ai-options';
-import { batchKey, checkBatchAllowance, withBatchLock, type IdentificationBatch } from './batch';
+import {
+  aiRecoveryNotBeforeKey,
+  batchKey,
+  checkBatchAllowance,
+  withBatchLock,
+  type IdentificationBatch,
+} from './batch';
 import { fileKey, type FileReference } from './bulk-entry';
 import { db, type CabinetDB, friendlyError, setting, setSetting } from './db';
 import {
@@ -12,10 +18,12 @@ import {
   type PhotoAnalysis,
   type PhotoAnalysisResult,
 } from './photo-analysis';
+import { normalizeProcessingSpeed, speedProfiles, type ProcessingSpeed } from './processing-speed';
 
 export const photoMatchingKey = 'aiPhotoMatching';
 export const photoMatchingLastAttemptKey = 'aiPhotoMatchingLastAttemptAt';
 export type PhotoMatchingOutcome = { analysis?: PhotoAnalysis; error?: string };
+export type PhotoMatchingRequest = { keys: string[]; index: number; startedAt: number };
 export type PhotoMatchingJob = {
   version: 1;
   id: string;
@@ -29,6 +37,9 @@ export type PhotoMatchingJob = {
   results: Record<string, PhotoMatchingOutcome>;
   reviewPairs?: [FileReference, FileReference][];
   error: string;
+  speed?: ProcessingSpeed;
+  nextCursor?: number;
+  inFlight?: PhotoMatchingRequest[];
 };
 export type PhotoMatchingActivity = {
   phase: 'analyzing' | 'waiting' | 'paused' | 'complete';
@@ -38,7 +49,12 @@ type Lock = <T>(action: () => Promise<T>) => Promise<T>;
 export type PhotoMatchingOptions = {
   database?: CabinetDB;
   lock?: Lock;
-  analyze?: (blobs: Blob[], options: IdentificationOptions) => Promise<PhotoAnalysisResult>;
+  analyze?: (
+    blobs: Blob[],
+    options: IdentificationOptions,
+    speed?: ProcessingSpeed,
+  ) => Promise<PhotoAnalysisResult>;
+  speed?: ProcessingSpeed;
   ready?: () => Promise<void>;
   signal?: AbortSignal;
   now?: () => number;
@@ -48,6 +64,51 @@ export type PhotoMatchingOptions = {
 
 export function getPhotoMatchingJob(database = db) {
   return setting<PhotoMatchingJob | null>(photoMatchingKey, null, database);
+}
+
+function normalizeJob(saved: PhotoMatchingJob): PhotoMatchingJob & {
+  nextCursor: number;
+  inFlight: PhotoMatchingRequest[];
+  speed: ProcessingSpeed;
+} {
+  const inFlight = saved.inFlight?.length
+    ? saved.inFlight
+    : saved.processing?.length
+      ? [{ keys: saved.processing, index: saved.cursor, startedAt: saved.lastAttemptAt }]
+      : [];
+  return {
+    ...saved,
+    identificationOptions: normalizeIdentificationOptions(saved.identificationOptions),
+    speed: normalizeProcessingSpeed(saved.speed),
+    inFlight,
+    nextCursor: Math.max(
+      saved.nextCursor ?? saved.cursor,
+      ...inFlight.map((request) => request.index + request.keys.length),
+    ),
+    processing: inFlight.length ? inFlight.flatMap((request) => request.keys) : null,
+    notBefore: saved.notBefore || 0,
+  };
+}
+
+export function analysisPendingFiles(job: PhotoMatchingJob): FileReference[] {
+  return job.files.slice(normalizeJob(job).nextCursor);
+}
+
+async function batchTiming(database: CabinetDB, now: () => number) {
+  const batch = await setting<IdentificationBatch | null>(batchKey, null, database);
+  const lastAttemptAt = Math.max(
+    await setting(photoMatchingLastAttemptKey, 0, database),
+    batch?.lastStart || 0,
+  );
+  return {
+    lastAttemptAt,
+    notBefore: Math.max(
+      batch?.notBefore || 0,
+      await setting(aiRecoveryNotBeforeKey, 0, database),
+      lastAttemptAt > now() ? lastAttemptAt + 15000 : 0,
+      batch?.inFlight?.length || batch?.processing ? now() + aiLeaseMs : 0,
+    ),
+  };
 }
 
 async function ready(options: PhotoMatchingOptions, database: CabinetDB) {
@@ -92,11 +153,7 @@ export async function createPhotoMatchingJob(
     validateReferences(files);
     await ready(options, database);
     await checkBatchAllowance(Math.ceil(files.length / 2), database);
-    const batch = await setting<IdentificationBatch | null>(batchKey, null, database);
-    const lastAttemptAt = Math.max(
-      await setting(photoMatchingLastAttemptKey, 0, database),
-      batch?.lastStart || 0,
-    );
+    const timing = await batchTiming(database, now);
     const job: PhotoMatchingJob = {
       version: 1,
       id: crypto.randomUUID(),
@@ -105,10 +162,13 @@ export async function createPhotoMatchingJob(
       cursor: 0,
       processing: null,
       status: 'paused',
-      lastAttemptAt,
-      notBefore: batch?.processing ? now() + aiLeaseMs : 0,
+      lastAttemptAt: timing.lastAttemptAt,
+      notBefore: timing.notBefore,
       results: {},
       error: '',
+      speed: normalizeProcessingSpeed(options.speed),
+      nextCursor: 0,
+      inFlight: [],
     };
     await setSetting(photoMatchingKey, job, database);
     return job;
@@ -151,111 +211,180 @@ export async function runPhotoMatchingJob(
   const now = options.now || Date.now;
   const analyze = options.analyze || analyzePhotos;
   return (options.lock || withBatchLock)(async () => {
-    const saved = await getPhotoMatchingJob(database);
-    if (!saved || saved.id !== id)
-      throw new Error('The saved photo analysis changed. Reopen it before continuing.');
-    let job: PhotoMatchingJob = saved;
-    const progress = (activity: PhotoMatchingActivity) =>
-      options.onProgress?.(structuredClone(job), activity);
-    const save = () =>
+    const read = async () => {
+      const saved = await getPhotoMatchingJob(database);
+      if (!saved || saved.id !== id)
+        throw new Error('The saved photo analysis changed. Reopen it before continuing.');
+      return normalizeJob(saved);
+    };
+    type Job = Awaited<ReturnType<typeof read>>;
+    const update = (change: (job: Job) => Promise<void> | void) =>
       database.transaction('rw', database.settings, async () => {
-        await setSetting(photoMatchingKey, job, database);
-        await setSetting(photoMatchingLastAttemptKey, job.lastAttemptAt, database);
+        const current = await read();
+        await change(current);
+        current.processing = current.inFlight.length
+          ? current.inFlight.flatMap((request) => request.keys)
+          : null;
+        await setSetting(photoMatchingKey, current, database);
+        await setSetting(
+          photoMatchingLastAttemptKey,
+          Math.max(current.lastAttemptAt, await setting(photoMatchingLastAttemptKey, 0, database)),
+          database,
+        );
+        return current;
       });
-    if (job.processing?.length) {
-      for (const key of job.processing)
-        job.results[key] = {
-          error:
-            'Interrupted request. Its outcome is unknown and it may have used API credit. This photo was not retried.',
-        };
-      job.cursor += job.processing.length;
-      job.processing = null;
-      job.notBefore = now() + aiLeaseMs;
-      job.status = 'paused';
-      await save();
+    let job = await read();
+    const progress = (current: PhotoMatchingJob, activity: PhotoMatchingActivity) =>
+      options.onProgress?.(structuredClone(current), activity);
+    if (job.inFlight.length) {
+      job = await update(async (current) => {
+        for (const request of current.inFlight) {
+          for (const key of request.keys)
+            current.results[key] = {
+              error:
+                'Interrupted request. Its outcome is unknown and it may have used API credit. This photo was not retried.',
+            };
+          current.cursor += request.keys.length;
+        }
+        current.inFlight = [];
+        current.processing = null;
+        current.notBefore = Math.max(current.notBefore, now() + aiLeaseMs);
+        current.status = 'paused';
+        await setSetting(
+          aiRecoveryNotBeforeKey,
+          Math.max(current.notBefore, await setting(aiRecoveryNotBeforeKey, 0, database)),
+          database,
+        );
+      });
     }
+    const speed = normalizeProcessingSpeed(options.speed ?? job.speed);
+    const profile = speedProfiles[speed];
+    const identificationOptions = normalizeIdentificationOptions(job.identificationOptions);
     if (job.cursor >= job.files.length) {
-      job.status = 'complete';
-      job.error = '';
-      await save();
-      progress({ phase: 'complete' });
+      job = await update((current) => {
+        current.speed = speed;
+        current.status = 'complete';
+        current.error = '';
+      });
+      progress(job, { phase: 'complete' });
       return job;
     }
-    // Missing originals are recoverable and do not consume an attempt or skip photos.
-    requireFiles(job.files.slice(job.cursor), files);
+    // Missing originals do not consume an attempt or skip photos.
+    requireFiles(job.files.slice(job.nextCursor), files);
     await ready(options, database);
-    await checkBatchAllowance(Math.ceil((job.files.length - job.cursor) / 2), database);
-    const batch = await setting<IdentificationBatch | null>(batchKey, null, database);
-    job.lastAttemptAt = Math.max(
-      job.lastAttemptAt,
-      batch?.lastStart || 0,
-      await setting(photoMatchingLastAttemptKey, 0, database),
-    );
-    if (batch?.processing) job.notBefore = Math.max(job.notBefore, now() + aiLeaseMs);
-    job.status = 'running';
-    job.error = '';
-    await save();
+    await checkBatchAllowance(Math.ceil((job.files.length - job.nextCursor) / 2), database);
+    const timing = await batchTiming(database, now);
+    job = await update((current) => {
+      current.speed = speed;
+      current.lastAttemptAt = Math.max(current.lastAttemptAt, timing.lastAttemptAt);
+      current.notBefore = Math.max(current.notBefore, timing.notBefore);
+      current.status = 'running';
+      current.error = '';
+    });
+    let stopped = false;
+    let fatal: unknown;
+    const attempt = async (request: PhotoMatchingRequest, blobs: Blob[]) => {
+      let result: PhotoAnalysisResult | undefined;
+      let failure = '';
+      try {
+        result = photoAnalysisResultSchema.parse(
+          await analyze(blobs, identificationOptions, speed),
+        );
+        if (result.photos.length !== request.keys.length)
+          throw new Error(
+            'Photo analysis returned the wrong number of descriptions. No automatic retry was sent.',
+          );
+      } catch (error) {
+        stopped = true;
+        failure = friendlyError(error);
+      }
+      const saved = await update((current) => {
+        if (!current.inFlight.some((item) => item.index === request.index))
+          throw new Error('This photo request changed before its result was saved.');
+        for (let index = 0; index < request.keys.length; index++) {
+          current.results[request.keys[index]] = failure
+            ? { error: failure }
+            : { analysis: result!.photos[index] };
+        }
+        current.cursor += request.keys.length;
+        current.inFlight = current.inFlight.filter((item) => item.index !== request.index);
+        current.lastAttemptAt = Math.max(current.lastAttemptAt, now());
+        if (failure)
+          current.error =
+            failure + ' Analysis stopped. Failed photos will not be retried automatically.';
+      });
+      progress(saved, { phase: stopped || options.signal?.aborted ? 'paused' : 'analyzing' });
+    };
     try {
-      while (job.cursor < job.files.length && !options.signal?.aborted) {
-        const until = Math.max(job.lastAttemptAt + 15000, job.notBefore);
+      while (job.nextCursor < job.files.length && !options.signal?.aborted && !stopped) {
+        const until = Math.max(job.lastAttemptAt + profile.delayMs, job.notBefore);
         const delay = Math.max(0, until - now());
         if (delay) {
-          progress({ phase: 'waiting', until });
+          progress(job, { phase: 'waiting', until });
           await (options.wait || wait)(delay, options.signal);
         }
         if (options.signal?.aborted) break;
-        const sources = job.files.slice(job.cursor, job.cursor + 2);
-        const blobs = requireFiles(sources, files);
-        job.processing = sources.map(fileKey);
-        job.lastAttemptAt = now();
-        job.notBefore = 0;
-        await save();
-        progress({ phase: 'analyzing' });
-        let result: PhotoAnalysisResult;
-        try {
-          result = photoAnalysisResultSchema.parse(await analyze(blobs, job.identificationOptions));
-          if (result.photos.length !== sources.length)
-            throw new Error(
-              'Photo analysis returned the wrong number of descriptions. No automatic retry was sent.',
+        const wave: Promise<void>[] = [];
+        for (
+          let slot = 0;
+          slot < profile.concurrency && !options.signal?.aborted && !stopped;
+          slot++
+        ) {
+          let request: PhotoMatchingRequest | undefined;
+          let blobs: File[] = [];
+          try {
+            job = await update((current) => {
+              if (stopped || options.signal?.aborted || current.nextCursor >= current.files.length)
+                return;
+              const index = current.nextCursor;
+              const sources = current.files.slice(index, index + 2);
+              blobs = requireFiles(sources, files);
+              request = { keys: sources.map(fileKey), index, startedAt: now() };
+              current.nextCursor += sources.length;
+              current.inFlight.push(request);
+              current.lastAttemptAt = Math.max(current.lastAttemptAt, request.startedAt);
+            });
+          } catch (error) {
+            stopped = true;
+            fatal = error;
+            break;
+          }
+          if (request) {
+            if (stopped || options.signal?.aborted) {
+              const unstarted = request;
+              try {
+                job = await update((current) => {
+                  current.inFlight = current.inFlight.filter(
+                    (item) => item.index !== unstarted.index,
+                  );
+                  current.nextCursor = unstarted.index;
+                });
+              } catch (error) {
+                fatal = error;
+              }
+              break;
+            }
+            wave.push(
+              attempt(request, blobs).catch((error) => {
+                stopped = true;
+                fatal = error;
+              }),
             );
-        } catch (error) {
-          const message = friendlyError(error);
-          for (const source of sources) job.results[fileKey(source)] = { error: message };
-          job.cursor += sources.length;
-          job.processing = null;
-          job.lastAttemptAt = now();
-          job.status = 'paused';
-          job.error =
-            message + ' Analysis stopped. These photos will not be retried automatically.';
-          await save();
-          progress({ phase: 'paused' });
-          return job;
+            progress(job, { phase: 'analyzing' });
+          }
         }
-        // Commit results and cursor together. A failed write leaves the in-flight checkpoint intact.
-        const next: PhotoMatchingJob = {
-          ...job,
-          results: { ...job.results },
-          cursor: job.cursor + sources.length,
-          processing: null,
-          lastAttemptAt: now(),
-        };
-        sources.forEach((source, index) => {
-          next.results[fileKey(source)] = { analysis: result.photos[index] };
-        });
-        await database.transaction('rw', database.settings, async () => {
-          await setSetting(photoMatchingKey, next, database);
-          await setSetting(photoMatchingLastAttemptKey, next.lastAttemptAt, database);
-        });
-        job = next;
-        progress({ phase: 'analyzing' });
+        await Promise.all(wave);
+        if (fatal) throw fatal;
+        job = await read();
       }
-      job.status = job.cursor >= job.files.length ? 'complete' : 'paused';
-      await save();
-      progress({ phase: job.status });
+      job = await update((current) => {
+        current.status = current.cursor >= current.files.length ? 'complete' : 'paused';
+      });
+      progress(job, { phase: job.status as 'complete' | 'paused' });
       return job;
     } catch (error) {
-      // Do not erase a persisted in-flight marker when storing a result failed.
-      progress({ phase: 'paused' });
+      // Keep unfinished checkpoints when local result storage fails.
+      progress(await read(), { phase: 'paused' });
       throw error;
     }
   });
@@ -267,19 +396,21 @@ export async function deletePhotoMatchingJob(id: string, options: PhotoMatchingO
     const job = await getPhotoMatchingJob(database);
     if (!job || job.id !== id) throw new Error('The saved photo analysis changed.');
     await database.transaction('rw', database.settings, async () => {
-      if (job.processing?.length)
-        await setSetting(
-          photoMatchingLastAttemptKey,
-          (options.now || Date.now)() + aiLeaseMs - 15000,
-          database,
-        );
+      const notBefore = Math.max(
+        job.notBefore || 0,
+        await setting(aiRecoveryNotBeforeKey, 0, database),
+        job.inFlight?.length || job.processing?.length
+          ? (options.now || Date.now)() + aiLeaseMs
+          : 0,
+      );
+      await setSetting(aiRecoveryNotBeforeKey, notBefore, database);
       await database.settings.delete(photoMatchingKey);
     });
   });
 }
 
 function validateReviewedPairs(job: PhotoMatchingJob, pairs: [FileReference, FileReference][]) {
-  if (job.status !== 'complete' || job.processing)
+  if (job.status !== 'complete' || job.processing || job.inFlight?.length)
     throw new Error('Finish photo analysis before accepting pairs.');
   const known = new Set(job.files.map(fileKey));
   const accepted = new Set<string>();
@@ -335,6 +466,8 @@ export async function consumePhotoMatchingPairs(
       files: remaining,
       results,
       cursor: remaining.length,
+      nextCursor: remaining.length,
+      inFlight: [],
       status: 'complete',
       processing: null,
       ...(job.reviewPairs !== undefined

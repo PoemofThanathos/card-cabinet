@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Dexie from 'dexie';
 import { CabinetDB, setting, setSetting } from '../src/db';
 import { aiLeaseMs, type IdentificationOptions } from '../src/ai-options';
+import { type ProcessingSpeed } from '../src/processing-speed';
 import { fileKey, fileReference, type FileReference } from '../src/bulk-entry';
 import { type PhotoAnalysis, type PhotoAnalysisResult } from '../src/photo-analysis';
 import {
   consumePhotoMatchingPairs,
+  analysisPendingFiles,
   createPhotoMatchingJob,
   deletePhotoMatchingJob,
   derivePhotoMatches,
@@ -93,6 +95,238 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.restoreAllMocks();
   await database.delete();
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+describe('parallel photo analysis speeds', () => {
+  it.each([
+    ['fast', 2],
+    ['ultra', 4],
+  ] as const)(
+    'limits %s to %i requests and stores each out-of-order photo result',
+    async (speed, concurrency) => {
+      const { refs, map } = originals(11);
+      const job = await createPhotoMatchingJob(refs, chosen, { ...options(), speed });
+      const pending: {
+        blobs: Blob[];
+        response: ReturnType<typeof deferred<PhotoAnalysisResult>>;
+      }[] = [];
+      let active = 0,
+        peak = 0;
+      const runner = vi.fn(
+        async (blobs: Blob[], actual: IdentificationOptions, actualSpeed?: ProcessingSpeed) => {
+          expect(actual).toEqual(chosen);
+          expect(actualSpeed).toBe(speed);
+          const response = deferred<PhotoAnalysisResult>();
+          pending.push({ blobs, response });
+          peak = Math.max(peak, ++active);
+          try {
+            return await response.promise;
+          } finally {
+            active--;
+          }
+        },
+      );
+      const wait = vi.fn(options().wait);
+      const running = runPhotoMatchingJob(job.id, map, { ...options(), wait, analyze: runner });
+      const total = Math.ceil(refs.length / 2);
+      for (let start = 0; start < total; start += concurrency) {
+        const end = Math.min(start + concurrency, total);
+        await vi.waitFor(() => expect(pending).toHaveLength(end));
+        const checkpoint = (await getPhotoMatchingJob(database))!;
+        expect(checkpoint.inFlight).toHaveLength(end - start);
+        expect(checkpoint.nextCursor).toBe(Math.min(end * 2, refs.length));
+        expect(analysisPendingFiles(checkpoint)).toEqual(refs.slice(end * 2));
+        for (let index = end - 1; index >= start; index--) {
+          pending[index].response.resolve(await analyze(pending[index].blobs));
+          const key = fileKey(pending[index].blobs[0] as File);
+          await vi.waitFor(async () =>
+            expect((await getPhotoMatchingJob(database))?.results[key].analysis).toBeDefined(),
+          );
+        }
+      }
+      const finished = await running;
+      expect(peak).toBe(concurrency);
+      expect(wait).not.toHaveBeenCalled();
+      expect(finished.cursor).toBe(refs.length);
+      expect(finished.inFlight).toEqual([]);
+      expect(finished.status).toBe('complete');
+      refs.forEach((ref, index) => {
+        expect(finished.results[fileKey(ref)].analysis?.cardNumber).toBe(
+          String(Math.floor(index / 2) + 1),
+        );
+        expect(finished.results[fileKey(ref)].analysis?.side).toBe(index % 2 ? 'back' : 'front');
+      });
+      expect(derivePhotoMatches(finished).pairs).toHaveLength(5);
+    },
+  );
+
+  it('keeps a successful peer after failure and resumes only untouched chunks', async () => {
+    const { refs, map } = originals(10);
+    const job = await createPhotoMatchingJob(refs, chosen, { ...options(), speed: 'fast' });
+    const responses = [deferred<PhotoAnalysisResult>(), deferred<PhotoAnalysisResult>()];
+    const blobs: Blob[][] = [];
+    const running = runPhotoMatchingJob(job.id, map, {
+      ...options(),
+      analyze: async (chunk) => {
+        blobs.push(chunk);
+        return responses[blobs.length - 1].promise;
+      },
+    });
+    await vi.waitFor(() => expect(blobs).toHaveLength(2));
+    responses[1].reject(new Error('Quota exhausted'));
+    await vi.waitFor(async () =>
+      expect((await getPhotoMatchingJob(database))?.results[fileKey(refs[2])]?.error).toBe(
+        'Quota exhausted',
+      ),
+    );
+    responses[0].resolve(await analyze(blobs[0]));
+    const paused = await running;
+    expect(paused.status).toBe('paused');
+    expect(paused.cursor).toBe(4);
+    expect(paused.results[fileKey(refs[0])].analysis).toBeDefined();
+    analyze.mockClear();
+    const finished = await runPhotoMatchingJob(job.id, map, { ...options(), analyze });
+    expect(analyze.mock.calls.map(([chunk]) => (chunk[0] as File).name)).toEqual([
+      'photo-4.jpg',
+      'photo-6.jpg',
+      'photo-8.jpg',
+    ]);
+    expect(finished.cursor).toBe(10);
+    expect(finished.results[fileKey(refs[2])].error).toBe('Quota exhausted');
+  });
+
+  it('waits for active requests on pause and can resume at Normal speed', async () => {
+    const { refs, map } = originals(12);
+    const job = await createPhotoMatchingJob(refs, chosen, { ...options(), speed: 'ultra' });
+    const control = new AbortController();
+    const responses = Array.from({ length: 4 }, () => deferred<PhotoAnalysisResult>());
+    const chunks: Blob[][] = [];
+    const running = runPhotoMatchingJob(job.id, map, {
+      ...options(),
+      signal: control.signal,
+      analyze: async (blobs) => {
+        chunks.push(blobs);
+        return responses[chunks.length - 1].promise;
+      },
+    });
+    await vi.waitFor(() => expect(chunks).toHaveLength(4));
+    control.abort();
+    for (let index = 3; index >= 0; index--) responses[index].resolve(await analyze(chunks[index]));
+    const paused = await running;
+    expect(paused.cursor).toBe(8);
+    expect(paused.status).toBe('paused');
+    expect(paused.inFlight).toEqual([]);
+    const started: number[] = [];
+    const finished = await runPhotoMatchingJob(job.id, map, {
+      ...options(),
+      speed: 'normal',
+      analyze: async (blobs, _choice, actual) => {
+        expect(actual).toBe('normal');
+        started.push(clock);
+        return analyze(blobs);
+      },
+    });
+    expect(started).toHaveLength(2);
+    expect(started[1] - started[0]).toBeGreaterThanOrEqual(15000);
+    expect(finished.speed).toBe('normal');
+    expect(finished.cursor).toBe(12);
+  });
+
+  it('preserves completed chunks and recovers all unknown requests with a full lease at Fast speed', async () => {
+    const { refs, map } = originals(12);
+    const job = await createPhotoMatchingJob(refs, chosen, { ...options(), speed: 'ultra' });
+    const earlier = {
+      [fileKey(refs[4])]: { analysis: analysis('front', '3') },
+      [fileKey(refs[5])]: { analysis: analysis('back', '3') },
+    };
+    await setSetting(
+      photoMatchingKey,
+      {
+        ...job,
+        cursor: 2,
+        nextCursor: 8,
+        status: 'running',
+        results: earlier,
+        processing: [0, 1, 2, 3, 6, 7].map((index) => fileKey(refs[index])),
+        inFlight: [0, 2, 6].map((index) => ({
+          index,
+          keys: refs.slice(index, index + 2).map(fileKey),
+          startedAt: clock,
+        })),
+      },
+      database,
+    );
+    const recoveredAt = clock;
+    const runner = vi.fn(async (blobs: Blob[]) => {
+      expect(clock - recoveredAt).toBeGreaterThanOrEqual(aiLeaseMs);
+      return analyze(blobs);
+    });
+    const finished = await runPhotoMatchingJob(job.id, map, {
+      ...options(),
+      speed: 'fast',
+      analyze: runner,
+    });
+    expect(runner.mock.calls.map(([chunk]) => (chunk[0] as File).name)).toEqual([
+      'photo-8.jpg',
+      'photo-10.jpg',
+    ]);
+    expect(finished.cursor).toBe(12);
+    expect(finished.results[fileKey(refs[4])]).toEqual(earlier[fileKey(refs[4])]);
+    for (const index of [0, 1, 2, 3, 6, 7])
+      expect(finished.results[fileKey(refs[index])].error).toContain('not retried');
+    expect(finished.inFlight).toEqual([]);
+  });
+
+  it('does not lose the lease when an interrupted job is discarded and replaced at Ultra fast speed', async () => {
+    const { refs, map } = originals(4);
+    const job = await createPhotoMatchingJob(refs, chosen, { ...options(), speed: 'fast' });
+    job.processing = refs.slice(0, 2).map(fileKey);
+    await setSetting(photoMatchingKey, job, database);
+    const interruptedAt = clock;
+    await deletePhotoMatchingJob(job.id, options());
+    const next = await createPhotoMatchingJob(refs.slice(2), chosen, {
+      ...options(),
+      speed: 'ultra',
+    });
+    await runPhotoMatchingJob(next.id, map, {
+      ...options(),
+      analyze: async (blobs) => {
+        expect(clock - interruptedAt).toBeGreaterThanOrEqual(aiLeaseMs);
+        return analyze(blobs);
+      },
+    });
+  });
+
+  it('treats a legacy job as Normal and keeps its approved model', async () => {
+    const { refs, map } = originals(4);
+    const job = await createPhotoMatchingJob(refs, chosen, { ...options(), speed: 'ultra' });
+    delete job.speed;
+    delete job.nextCursor;
+    delete job.inFlight;
+    await setSetting(photoMatchingKey, job, database);
+    const starts: number[] = [];
+    const finished = await runPhotoMatchingJob(job.id, map, {
+      ...options(),
+      analyze: async (blobs, actual, speed) => {
+        expect(actual).toEqual(chosen);
+        expect(speed).toBe('normal');
+        starts.push(clock);
+        return analyze(blobs);
+      },
+    });
+    expect(starts[1] - starts[0]).toBeGreaterThanOrEqual(15000);
+    expect(finished.speed).toBe('normal');
+  });
 });
 
 describe('global photo pairing', () => {
@@ -225,7 +459,7 @@ describe('photo analysis progress', () => {
     const job = await createPhotoMatchingJob(refs, chosen, options());
     await setSetting('aiBatch', { processing: 'unknown-card', lastStart: clock }, database);
     const resumedAt = clock;
-    await runPhotoMatchingJob(job.id, map, { ...options(), analyze });
+    await runPhotoMatchingJob(job.id, map, { ...options(), speed: 'ultra', analyze });
     expect(analyze).toHaveBeenCalledTimes(1);
     expect(clock - resumedAt).toBeGreaterThanOrEqual(aiLeaseMs);
   });

@@ -49,6 +49,22 @@ describe('photo analysis requests', () => {
   };
   const photo = () => new Blob(['photo fixture'], { type: 'image/jpeg' });
 
+  it.each(['normal', 'fast', 'ultra'] as const)(
+    'sends explicit %s speed with photo analysis',
+    async (speed) => {
+      fetcher.mockResolvedValue(Response.json({ photos: [description] }));
+      await analyzePhotos([photo()], options, speed);
+      const [, request] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+      expect(JSON.parse(request.body as string)).toMatchObject({
+        task: 'analyze_photos',
+        speed,
+        ...options,
+      });
+      expect(request.headers).toMatchObject({ Authorization: 'Bearer test-token' });
+      expect(await setting('aiUsage', null)).toEqual({ day: day(), count: 1 });
+    },
+  );
+
   it.each([1, 2])('analyzes %i independent photos in one billed attempt', async (count) => {
     fetcher.mockResolvedValue(
       Response.json({ photos: Array.from({ length: count }, () => description) }),
@@ -113,6 +129,33 @@ afterEach(async () => {
 });
 
 describe('identification allowance', () => {
+  it.each(['normal', 'fast', 'ultra'] as const)(
+    'sends %s speed without changing the model snapshot',
+    async (speed) => {
+      const choice = { model: 'gpt-6-astra', reasoningEffort: 'high' } as const;
+      await identify(card, choice, speed);
+      const [, request] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+      expect(JSON.parse(request.body as string)).toMatchObject({
+        ...choice,
+        speed,
+        unlimited: false,
+      });
+    },
+  );
+
+  it('reserves only the remaining capped attempts among four Ultra fast calls', async () => {
+    await setSetting('aiUsage', { day: day(), count: 1 });
+    const results = await Promise.allSettled(
+      Array.from({ length: 4 }, () => identify(card, undefined, 'ultra')),
+    );
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(2);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await setting('aiUsage', null)).toEqual({ day: day(), count: 3 });
+    for (const [, request] of fetcher.mock.calls as unknown as [string, RequestInit][]) {
+      expect(JSON.parse(request.body as string).speed).toBe('ultra');
+      expect(request.headers).toMatchObject({ Authorization: 'Bearer test-token' });
+    }
+  });
   it('keeps identification off until enabled, even with unlimited attempts selected', async () => {
     await setSetting('aiEnabled', false);
     await setSetting('aiUnlimited', true);
@@ -134,6 +177,7 @@ describe('identification allowance', () => {
     const body = JSON.parse(options.body as string);
     expect(url).toBe('https://worker.example/identify');
     expect(body.unlimited).toBe(false);
+    expect(body.speed).toBe('normal');
     expect(body).toMatchObject({ model: 'gpt-6-luna', reasoningEffort: 'low' });
     expect(body.images).toHaveLength(2);
     expect(options.headers).toMatchObject({ Authorization: 'Bearer test-token' });

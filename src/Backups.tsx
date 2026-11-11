@@ -66,6 +66,12 @@ export function ImportReview({
         Existing IDs identify physical copies. Repeated imports keep the same copy. Different IDs
         always remain separate.
       </p>
+      {!!pack.reviews?.length && (
+        <p className="notice">
+          Identification suggestions are included. Suggestions for new, replaced or copied cards
+          stay unapproved. Open the identification batch in All cards to review them.
+        </p>
+      )}
       {pack.missing.length > 0 && (
         <p className="notice warning">
           This package refers to {pack.missing.length} photos it does not contain. Metadata can

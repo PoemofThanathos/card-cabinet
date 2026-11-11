@@ -7,10 +7,13 @@ import {
 } from './ai-options';
 import { auth } from './firebase';
 import { plainCard, sameCard, title, type Card, type Suggestions } from './model';
+import { normalizeProcessingSpeed, speedProfiles, type ProcessingSpeed } from './processing-speed';
 
 export const batchKey = 'aiBatch';
 export const reviewPrefix = 'aiBatchReview:';
+export const aiRecoveryNotBeforeKey = 'aiRecoveryNotBefore';
 export type BatchFailure = { cardId: string; name: string; error: string };
+export type BatchRequest = { cardId: string; index: number; startedAt: number };
 export type IdentificationBatch = {
   version: 1;
   id: string;
@@ -22,6 +25,10 @@ export type IdentificationBatch = {
   failures: BatchFailure[];
   error: string;
   identificationOptions?: IdentificationOptions;
+  speed?: ProcessingSpeed;
+  nextPosition?: number;
+  inFlight?: BatchRequest[];
+  notBefore?: number;
 };
 export type BatchReview = {
   batchId: string;
@@ -37,8 +44,10 @@ type Options = {
   identifyCard?: (
     card: Card,
     identificationOptions?: IdentificationOptions,
+    speed?: ProcessingSpeed,
   ) => Promise<Suggestions>;
   identificationOptions?: IdentificationOptions;
+  speed?: ProcessingSpeed;
   ready?: () => Promise<void>;
   signal?: AbortSignal;
   now?: () => number;
@@ -127,18 +136,54 @@ async function checkCards(ids: string[], database: CabinetDB, skipUnavailable = 
   return available;
 }
 
-async function photoMatchingLastStart(database: CabinetDB, now: () => number) {
+async function photoMatchingTiming(database: CabinetDB, now: () => number) {
   const matching = await setting<{
     processing?: string[] | null;
+    inFlight?: unknown[];
     lastAttemptAt?: number;
     notBefore?: number;
   } | null>('aiPhotoMatching', null, database);
-  return Math.max(
+  const lastStart = Math.max(
     await setting<number>('aiPhotoMatchingLastAttemptAt', 0, database),
     matching?.lastAttemptAt || 0,
-    (matching?.notBefore || 0) - 15000,
-    matching?.processing?.length ? now() + aiLeaseMs - 15000 : 0,
   );
+  return {
+    lastStart,
+    notBefore: Math.max(
+      matching?.notBefore || 0,
+      await setting<number>(aiRecoveryNotBeforeKey, 0, database),
+      // Older discarded jobs stored a future cooldown in the timestamp itself.
+      lastStart > now() ? lastStart + 15000 : 0,
+      matching?.inFlight?.length || matching?.processing?.length ? now() + aiLeaseMs : 0,
+    ),
+  };
+}
+
+function normalizeBatch(
+  saved: IdentificationBatch,
+): IdentificationBatch & {
+  nextPosition: number;
+  inFlight: BatchRequest[];
+  notBefore: number;
+  speed: ProcessingSpeed;
+} {
+  const inFlight = saved.inFlight?.length
+    ? saved.inFlight
+    : saved.processing
+      ? [{ cardId: saved.processing, index: saved.position, startedAt: saved.lastStart }]
+      : [];
+  return {
+    ...saved,
+    identificationOptions: normalizeIdentificationOptions(saved.identificationOptions),
+    speed: normalizeProcessingSpeed(saved.speed),
+    inFlight,
+    nextPosition: Math.max(
+      saved.nextPosition ?? saved.position,
+      ...inFlight.map((request) => request.index + 1),
+    ),
+    notBefore: saved.notBefore || 0,
+    processing: inFlight[0]?.cardId || null,
+  };
 }
 
 export async function createBatch(cardIds: string[], options: Options = {}) {
@@ -153,6 +198,8 @@ export async function createBatch(cardIds: string[], options: Options = {}) {
     await checkBatchAllowance(ids.length, database);
     await checkCards(ids, database);
     const previous = await setting<IdentificationBatch | null>(batchKey, null, database);
+    const now = options.now || Date.now;
+    const matching = await photoMatchingTiming(database, now);
     const batch: IdentificationBatch = {
       version: 1,
       id: crypto.randomUUID(),
@@ -160,13 +207,19 @@ export async function createBatch(cardIds: string[], options: Options = {}) {
       position: 0,
       processing: null,
       status: 'paused',
-      lastStart: Math.max(
-        previous?.lastStart || 0,
-        await photoMatchingLastStart(database, options.now || Date.now),
-      ),
+      lastStart: Math.max(previous?.lastStart || 0, matching.lastStart),
       failures: [],
       error: '',
       identificationOptions,
+      speed: normalizeProcessingSpeed(options.speed),
+      nextPosition: 0,
+      inFlight: [],
+      notBefore: Math.max(
+        previous?.notBefore || 0,
+        matching.notBefore,
+        (previous?.lastStart || 0) > now() ? previous!.lastStart + 15000 : 0,
+        previous?.inFlight?.length || previous?.processing ? now() + aiLeaseMs : 0,
+      ),
     };
     await setSetting(batchKey, batch, database);
     return batch;
@@ -194,114 +247,190 @@ export async function runBatch(batchId: string, options: Options = {}) {
   const now = options.now || Date.now;
   const identifyCard = options.identifyCard || identify;
   return (options.lock || withBatchLock)(async () => {
-    const saved = await setting<IdentificationBatch | null>(batchKey, null, database);
-    if (!saved || saved.id !== batchId)
-      throw new Error('The saved batch changed. Reopen it before continuing.');
-    const identificationOptions = normalizeIdentificationOptions(saved.identificationOptions);
-    let batch: IdentificationBatch = { ...saved, identificationOptions };
-    const save = async () =>
+    const read = async () => {
+      const saved = await setting<IdentificationBatch | null>(batchKey, null, database);
+      if (!saved || saved.id !== batchId)
+        throw new Error('The saved batch changed. Reopen it before continuing.');
+      return normalizeBatch(saved);
+    };
+    type Job = Awaited<ReturnType<typeof read>>;
+    // Every writer reads the latest job inside the same transaction. Parallel responses
+    // and permanent deletion cannot overwrite one another's saved results or failures.
+    const update = (change: (job: Job) => Promise<void> | void) =>
       database.transaction('rw', database.cards, database.settings, async () => {
-        batch = await scrubBatch(batch, database);
-        await setSetting(batchKey, batch, database);
+        const job = await read();
+        await change(job);
+        job.processing = job.inFlight[0]?.cardId || null;
+        const clean = normalizeBatch(await scrubBatch(job, database));
+        await setSetting(batchKey, clean, database);
+        return clean;
       });
-    // A stored in-flight request has an unknown outcome after a reload. Never send it again.
-    if (batch.processing) {
-      const card = await database.cards.get(batch.processing);
-      batch.failures.push({
-        cardId: batch.processing,
-        name: card && !unavailableCard(card) ? title(card) : 'Unavailable card',
-        error:
-          'Interrupted scan. Its outcome is unknown and it may have been billed. It was not retried.',
+    let batch = await read();
+    if (batch.inFlight.length) {
+      batch = await update(async (job) => {
+        for (const request of job.inFlight) {
+          const card = await database.cards.get(request.cardId);
+          job.failures.push({
+            cardId: request.cardId,
+            name: card && !unavailableCard(card) ? title(card) : 'Unavailable card',
+            error:
+              'Interrupted scan. Its outcome is unknown and it may have been billed. It was not retried.',
+          });
+          job.position++;
+        }
+        job.inFlight = [];
+        job.processing = null;
+        job.notBefore = Math.max(job.notBefore, now() + aiLeaseMs);
+        job.status = 'paused';
+        await setSetting(
+          aiRecoveryNotBeforeKey,
+          Math.max(job.notBefore, await setting(aiRecoveryNotBeforeKey, 0, database)),
+          database,
+        );
       });
-      batch.position++;
-      batch.processing = null;
-      // Wait out the full server lease after recovery because the old request's send time is unknown.
-      batch.lastStart = now() + aiLeaseMs - 15000;
-      batch.status = 'paused';
-      await save();
     }
+    const speed = normalizeProcessingSpeed(options.speed ?? batch.speed);
+    const profile = speedProfiles[speed];
+    const identificationOptions = normalizeIdentificationOptions(batch.identificationOptions);
     if (batch.position >= batch.cardIds.length) {
-      batch.status = 'complete';
-      batch.error = '';
-      await save();
-      return batch;
+      return update((job) => {
+        job.speed = speed;
+        job.status = 'complete';
+        job.error = '';
+      });
     }
     await (options.ready || ready)();
-    const available = await checkCards(batch.cardIds.slice(batch.position), database, true);
+    const available = await checkCards(batch.cardIds.slice(batch.nextPosition), database, true);
     await checkBatchAllowance(available, database);
-    batch.lastStart = Math.max(batch.lastStart, await photoMatchingLastStart(database, now));
-    batch.status = 'running';
-    batch.error = '';
-    await save();
+    const matching = await photoMatchingTiming(database, now);
+    batch = await update((job) => {
+      job.speed = speed;
+      job.lastStart = Math.max(job.lastStart, matching.lastStart);
+      job.notBefore = Math.max(
+        job.notBefore,
+        matching.notBefore,
+        job.lastStart > now() ? job.lastStart + 15000 : 0,
+      );
+      job.status = 'running';
+      job.error = '';
+    });
+    let stopped = false;
+    let fatal: unknown;
+    const attempt = async (request: BatchRequest, card: Card) => {
+      let result: Suggestions | undefined;
+      let failure = '';
+      try {
+        result = await identifyCard(card, identificationOptions, speed);
+      } catch (error) {
+        stopped = true;
+        failure = friendlyError(error);
+      }
+      await update(async (job) => {
+        const pending = job.inFlight.find((item) => item.index === request.index);
+        if (!pending)
+          throw new Error('This identification request changed before its result was saved.');
+        const current = await database.cards.get(card.id);
+        const key = reviewPrefix + batchId + ':' + card.id;
+        if (failure) {
+          job.failures.push({ cardId: card.id, name: title(card), error: failure });
+          job.error =
+            failure + ' The batch stopped. Failed cards will not be retried automatically.';
+        } else if (unavailableCard(current)) {
+          await database.settings.delete(key);
+          job.failures.push({
+            cardId: card.id,
+            name: 'Unavailable card',
+            error: 'This card was removed during identification. Its suggestions were discarded.',
+          });
+        } else {
+          await setSetting(
+            key,
+            { batchId, card, result: result!, identificationOptions } satisfies BatchReview,
+            database,
+          );
+        }
+        job.position++;
+        job.inFlight = job.inFlight.filter((item) => item.index !== request.index);
+        job.lastStart = Math.max(job.lastStart, now());
+      });
+    };
     try {
-      while (batch.position < batch.cardIds.length && !options.signal?.aborted) {
-        const delay = Math.max(0, batch.lastStart + 15000 - now());
+      while (batch.nextPosition < batch.cardIds.length && !options.signal?.aborted && !stopped) {
+        const until = Math.max(batch.lastStart + profile.delayMs, batch.notBefore);
+        const delay = Math.max(0, until - now());
         if (delay) {
-          options.onActivity?.({ phase: 'waiting', until: batch.lastStart + 15000 });
+          options.onActivity?.({ phase: 'waiting', until });
           await (options.wait || wait)(delay, options.signal);
         }
         if (options.signal?.aborted) break;
-        const id = batch.cardIds[batch.position];
-        const local = await database.cards.get(id);
-        if (unavailableCard(local)) {
-          batch.failures.push({
-            cardId: id,
-            name: 'Unavailable card',
-            error: 'This card was removed before its scan.',
-          });
-          batch.position++;
-          continue;
-        }
-        if (!local) continue;
-        const card = plainCard(local);
-        batch.processing = id;
-        batch.lastStart = now();
-        await save();
-        options.onActivity?.({ phase: 'identifying' });
-        let result: Suggestions;
-        try {
-          result = await identifyCard(card, identificationOptions);
-        } catch (error) {
-          const message = friendlyError(error);
-          batch.failures.push({ cardId: id, name: title(card), error: message });
-          batch.position++;
-          batch.processing = null;
-          batch.lastStart = now();
-          batch.error =
-            message + ' The batch stopped. This card will not be retried automatically.';
-          break;
-        }
-        const next: IdentificationBatch = {
-          ...batch,
-          position: batch.position + 1,
-          processing: null,
-          lastStart: now(),
-        };
-        // A result and the next position commit together, so reload cannot lose a completed result.
-        await database.transaction('rw', database.cards, database.settings, async () => {
-          const current = await database.cards.get(id);
-          const key = reviewPrefix + batch!.id + ':' + id;
-          if (unavailableCard(current)) {
-            await database.settings.delete(key);
-            next.failures.push({
-              cardId: id,
-              name: 'Unavailable card',
-              error: 'This card was removed during identification. Its suggestions were discarded.',
+        const wave: Promise<void>[] = [];
+        for (
+          let slot = 0;
+          slot < profile.concurrency && !options.signal?.aborted && !stopped;
+          slot++
+        ) {
+          let selected: { request: BatchRequest; card: Card } | undefined;
+          try {
+            batch = await update(async (job) => {
+              if (stopped || options.signal?.aborted || job.nextPosition >= job.cardIds.length)
+                return;
+              const index = job.nextPosition;
+              const card = await database.cards.get(job.cardIds[index]);
+              if (stopped || options.signal?.aborted) return;
+              job.nextPosition++;
+              if (unavailableCard(card)) {
+                job.failures.push({
+                  cardId: job.cardIds[index],
+                  name: 'Unavailable card',
+                  error: 'This card was removed before its scan.',
+                });
+                job.position++;
+                return;
+              }
+              const request: BatchRequest = { cardId: card!.id, index, startedAt: now() };
+              job.inFlight.push(request);
+              job.lastStart = Math.max(job.lastStart, request.startedAt);
+              selected = { request, card: plainCard(card!) };
             });
-          } else {
-            await setSetting(
-              key,
-              { batchId: batch!.id, card, result, identificationOptions } satisfies BatchReview,
-              database,
-            );
+          } catch (error) {
+            stopped = true;
+            fatal = error;
+            break;
           }
-          batch = await scrubBatch(next, database);
-          await setSetting(batchKey, batch, database);
-        });
+          if (selected) {
+            if (stopped || options.signal?.aborted) {
+              const unstarted = selected;
+              try {
+                batch = await update((job) => {
+                  job.inFlight = job.inFlight.filter(
+                    (item) => item.index !== unstarted.request.index,
+                  );
+                  job.nextPosition = unstarted.request.index;
+                });
+              } catch (error) {
+                fatal = error;
+              }
+              break;
+            }
+            // Attach a rejection handler immediately while other requests are checkpointed.
+            const active = selected;
+            wave.push(
+              attempt(active.request, active.card).catch((error) => {
+                stopped = true;
+                fatal = error;
+              }),
+            );
+            options.onActivity?.({ phase: 'identifying' });
+          }
+        }
+        // Pause and failure stop launches, but every already-sent result is still stored.
+        await Promise.all(wave);
+        if (fatal) throw fatal;
+        batch = await read();
       }
-      batch.status = batch.position >= batch.cardIds.length ? 'complete' : 'paused';
-      await save();
-      return batch;
+      return await update((job) => {
+        job.status = job.position >= job.cardIds.length ? 'complete' : 'paused';
+      });
     } finally {
       options.onActivity?.({ phase: 'idle' });
     }

@@ -10,7 +10,23 @@ import {
   sameCard,
   copyCard,
   hashSchema,
+  suggestionSchema,
 } from './model';
+import { aiModels, reasoningEfforts } from './ai-options';
+import { reviewPrefix, type BatchReview } from './batch';
+
+const importedReviewSchema = z
+  .object({
+    cardId: z.uuid(),
+    result: suggestionSchema,
+    identificationOptions: z
+      .object({
+        model: z.enum(aiModels),
+        reasoningEffort: z.enum(reasoningEfforts),
+      })
+      .strict(),
+  })
+  .strict();
 
 export const PACKAGE_LIMIT = 200 * 1024 * 1024;
 const manifestSchema = z
@@ -19,6 +35,7 @@ const manifestSchema = z
     version: z.literal(1),
     exportedAt: z.iso.datetime(),
     cards: z.array(cardSchema),
+    reviews: z.array(importedReviewSchema).optional(),
     photos: z.array(
       z
         .object({
@@ -34,7 +51,12 @@ const manifestSchema = z
     ),
   })
   .strict();
-export type ImportPackage = { cards: Card[]; photos: Photo[]; missing: string[] };
+export type ImportPackage = {
+  cards: Card[];
+  photos: Photo[];
+  missing: string[];
+  reviews?: z.infer<typeof importedReviewSchema>[];
+};
 export type ImportRow = {
   card: Card;
   existing?: Card;
@@ -122,6 +144,18 @@ export async function readPackage(blob: Blob): Promise<ImportPackage> {
   if (!result.success)
     throw new Error('Unsupported backup version or invalid metadata. Nothing was imported.');
   const manifest = result.data;
+  const cardIds = new Set(manifest.cards.map((card) => card.id));
+  if (
+    manifest.reviews &&
+    (new Set(manifest.reviews.map((review) => review.cardId)).size !== manifest.reviews.length ||
+      manifest.reviews.some(
+        (review) =>
+          !cardIds.has(review.cardId) ||
+          new Set(review.result.suggestions.map((s) => s.field)).size !==
+            review.result.suggestions.length,
+      ))
+  )
+    throw new Error('Invalid identification reviews. Nothing was imported.');
   if (manifest.cards.some((card) => card.status === 'purged'))
     throw new Error(
       'Permanent-deletion records cannot be imported as cards. Export a new backup from the source device.',
@@ -146,6 +180,7 @@ export async function readPackage(blob: Blob): Promise<ImportPackage> {
   const hashes = new Set(photos.map((p) => p.hash));
   return {
     cards: manifest.cards,
+    reviews: manifest.reviews,
     photos,
     missing: [
       ...new Set(
@@ -180,52 +215,72 @@ export async function planImport(pack: ImportPackage, database = db): Promise<Im
   );
 }
 export async function applyImport(pack: ImportPackage, rows: ImportRow[], database = db) {
-  await database.transaction('rw', database.cards, database.photos, database.queue, async () => {
-    for (const row of rows) {
-      const now = await database.cards.get(row.card.id);
-      if (row.card.status === 'purged')
-        throw new Error('Permanent-deletion records cannot be imported as cards.');
-      if (now?.status === 'purged' && (row.kind !== 'purged' || row.choice === 'replace'))
-        throw new Error(
-          'This card was permanently deleted. Open the backup again and choose Import as a new copy if you want a separate card.',
-        );
-      if (!!now !== !!row.existing || (now && row.existing && !sameCard(now, row.existing)))
-        throw new Error(
-          'A card changed after this review. Open the package again to review the latest collection.',
-        );
-    }
-    const photoHashes = new Set<string>();
-    const includePhotos = (card: Card) => {
-      for (const hash of Object.values(card.photos)) if (hash) photoHashes.add(hash);
-    };
-    for (const row of rows) {
-      if (row.kind === 'purged' && row.choice !== 'copy') continue;
-      if (row.kind !== 'new' && (row.kind === 'same' || row.choice === 'keep')) {
-        if (row.existing && row.existing.status !== 'purged') includePhotos(row.existing);
-        continue;
+  await database.transaction(
+    'rw',
+    database.cards,
+    database.photos,
+    database.queue,
+    database.settings,
+    async () => {
+      for (const row of rows) {
+        const now = await database.cards.get(row.card.id);
+        if (row.card.status === 'purged')
+          throw new Error('Permanent-deletion records cannot be imported as cards.');
+        if (now?.status === 'purged' && (row.kind !== 'purged' || row.choice === 'replace'))
+          throw new Error(
+            'This card was permanently deleted. Open the backup again and choose Import as a new copy if you want a separate card.',
+          );
+        if (!!now !== !!row.existing || (now && row.existing && !sameCard(now, row.existing)))
+          throw new Error(
+            'A card changed after this review. Open the package again to review the latest collection.',
+          );
       }
-      const card = row.choice === 'copy' ? copyCard(row.card) : row.card;
-      const old = await database.cards.get(card.id);
-      if (old?.status === 'purged')
-        throw new Error('This card was permanently deleted. Import it as a new copy.');
-      includePhotos(card);
-      const version = (old?.localVersion ?? 0) + 1;
-      await database.cards.put({
-        ...card,
-        baseRev: old?.baseRev ?? 0,
-        localVersion: version,
-        syncedVersion: old?.syncedVersion ?? 0,
-      });
-      await database.queue.put({
-        id: card.id,
-        mutationId: crypto.randomUUID(),
-        baseRev: old?.baseRev ?? 0,
-        version,
-        card,
-      });
-    }
-    await database.photos.bulkPut(pack.photos.filter((photo) => photoHashes.has(photo.hash)));
-  });
+      const photoHashes = new Set<string>();
+      const includePhotos = (card: Card) => {
+        for (const hash of Object.values(card.photos)) if (hash) photoHashes.add(hash);
+      };
+      for (const row of rows) {
+        if (row.kind === 'purged' && row.choice !== 'copy') continue;
+        if (row.kind !== 'new' && (row.kind === 'same' || row.choice === 'keep')) {
+          if (row.existing && row.existing.status !== 'purged') includePhotos(row.existing);
+          continue;
+        }
+        const card = row.choice === 'copy' ? copyCard(row.card) : row.card;
+        const old = await database.cards.get(card.id);
+        if (old?.status === 'purged')
+          throw new Error('This card was permanently deleted. Import it as a new copy.');
+        includePhotos(card);
+        const version = (old?.localVersion ?? 0) + 1;
+        await database.cards.put({
+          ...card,
+          baseRev: old?.baseRev ?? 0,
+          localVersion: version,
+          syncedVersion: old?.syncedVersion ?? 0,
+        });
+        await database.queue.put({
+          id: card.id,
+          mutationId: crypto.randomUUID(),
+          baseRev: old?.baseRev ?? 0,
+          version,
+          card,
+        });
+        const review = pack.reviews?.find((item) => item.cardId === row.card.id);
+        if (review && card.status !== 'deleted') {
+          const batchId = 'import:' + card.id;
+          await database.settings.put({
+            key: reviewPrefix + batchId + ':' + card.id,
+            value: {
+              batchId,
+              card,
+              result: review.result,
+              identificationOptions: review.identificationOptions,
+            } satisfies BatchReview,
+          });
+        }
+      }
+      await database.photos.bulkPut(pack.photos.filter((photo) => photoHashes.has(photo.hash)));
+    },
+  );
 }
 export function csvExport(cards: Card[]) {
   const cell = (s: string) =>

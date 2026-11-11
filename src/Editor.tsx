@@ -13,7 +13,7 @@ import {
 import { db, saveCard, setSetting, friendlyError } from './db';
 import { identify, readIdentificationOptions } from './ai';
 import { identificationLabel, type IdentificationOptions } from './ai-options';
-import { Modal, PhotoPicker } from './components';
+import { Modal, PhotoPicker, PhotoView } from './components';
 
 export function SuggestionReview({
   result,
@@ -53,6 +53,12 @@ export function SuggestionReview({
     <Modal title="Review identification" onClose={onClose} wide>
       {identificationOptions && (
         <p className="small muted">{identificationLabel(identificationOptions)}</p>
+      )}
+      {(card.photos.front || card.photos.back) && (
+        <div className="bulk-photo-pair">
+          <PhotoView hash={card.photos.front} alt="Front of card being reviewed" />
+          <PhotoView hash={card.photos.back} alt="Back of card being reviewed" />
+        </div>
       )}
       <p className="muted">
         Suggestions can be wrong. Select only the fields you want to apply. Inferences are separate

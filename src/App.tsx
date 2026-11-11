@@ -85,6 +85,8 @@ export default function App() {
     queue = useLiveQuery(() => db.queue.count(), []) || 0;
   const draft = useLiveQuery(() => setting<Draft | null>('draft', null), []);
   const savedBatch = useLiveQuery(() => setting<unknown>('aiBatch', null), []);
+  const pendingReviews =
+    useLiveQuery(() => db.settings.where('key').startsWith('aiBatchReview:').count(), []) ?? 0;
   const hashes = new Set(photos),
     conflictIds = new Set(conflicts.map((c) => c.id));
   const [page, setPage] = useState<'collection' | 'all' | 'players' | 'backups' | 'settings'>(
@@ -505,9 +507,13 @@ export default function App() {
                   </button>
                 </div>
               )}
-              {!!savedBatch && (
+              {(!!savedBatch || pendingReviews > 0) && (
                 <div className="draft-bar">
-                  <span>Identification batch saved on this device.</span>
+                  <span>
+                    {pendingReviews
+                      ? `${pendingReviews} identification results to review.`
+                      : 'Identification batch saved on this device.'}
+                  </span>
                   <button onClick={() => setBatch([])}>Open identification batch</button>
                 </div>
               )}

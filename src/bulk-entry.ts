@@ -1,7 +1,18 @@
-import { db, type CabinetDB, type Photo, makePhoto, saveCard, setting } from './db';
-import { type Card, type Field, newCard, cardSchema, sameCard, purgedCard } from './model';
+import { db, type CabinetDB, type Photo, makePhoto, setting } from './db';
+import {
+  type Card,
+  type Field,
+  type LocalCard,
+  type Operation,
+  newCard,
+  cardSchema,
+  sameCard,
+  purgedCard,
+  plainCard,
+} from './model';
 import { groupKey } from './groups';
-import { transformPhoto } from './photos';
+import { transformPhoto, fullCrop, photoProcessingCapabilities } from './photos';
+import { type ProcessingSpeed, normalizeProcessingSpeed, speedProfiles } from './processing-speed';
 
 export type PairOrder = 'alternating' | 'fronts-first';
 export type FileReference = { name: string; size: number; lastModified: number };
@@ -181,8 +192,7 @@ const entryKey = (id: string, index: number) => entryPrefix(id) + String(index).
 export function withBulkEntryTransaction<T>(action: () => Promise<T>, database = db) {
   return database.transaction('rw', database.settings, database.cards, action);
 }
-async function availableEntry(entry: BulkEntry, database: CabinetDB): Promise<BulkEntry> {
-  const current = await database.cards.get(entry.card.id);
+function availableEntry(entry: BulkEntry, current?: Card): BulkEntry {
   return current?.status === 'purged' || entry.card.status === 'purged'
     ? { card: purgedCard(current?.status === 'purged' ? current : entry.card), state: 'skipped' }
     : entry;
@@ -193,11 +203,14 @@ export async function getBulkEntryPlan(database = db) {
   const rows = await database.settings.where('key').startsWith(entryPrefix(header.id)).toArray();
   if (rows.length !== header.count)
     throw new Error('The saved import is incomplete. Your collection is still available.');
+  const current = await database.cards.bulkGet(rows.map((row) => (row.value as BulkEntry).card.id));
   return {
     id: header.id,
     kind: header.kind,
     ...(header.identifyAfterSaving ? { identifyAfterSaving: true } : {}),
-    entries: await Promise.all(rows.map((row) => availableEntry(row.value as BulkEntry, database))),
+    entries: rows
+      .map((row) => row.value as BulkEntry)
+      .map((entry, index) => availableEntry(entry, current[index])),
   };
 }
 export async function storeBulkEntryPlan(plan: BulkEntryPlan, database = db) {
@@ -205,7 +218,8 @@ export async function storeBulkEntryPlan(plan: BulkEntryPlan, database = db) {
     const previous = await setting<PlanHeader | null>(bulkEntryKey, null, database);
     if (previous)
       await database.settings.where('key').startsWith(entryPrefix(previous.id)).delete();
-    const entries = await Promise.all(plan.entries.map((entry) => availableEntry(entry, database)));
+    const current = await database.cards.bulkGet(plan.entries.map((entry) => entry.card.id));
+    const entries = plan.entries.map((entry, index) => availableEntry(entry, current[index]));
     await database.settings.bulkPut(
       entries.map((entry, index) => ({ key: entryKey(plan.id, index), value: entry })),
     );
@@ -241,7 +255,7 @@ export async function changeBulkEntry(
       throw new Error('This import changed in another tab. Reopen Bulk add.');
     let entry = await setting<BulkEntry | null>(entryKey(planId, index), null, database);
     if (!entry) throw new Error('This import entry is missing. Reopen Bulk add.');
-    entry = await availableEntry(entry, database);
+    entry = availableEntry(entry, await database.cards.get(entry.card.id));
     if (entry.card.status === 'purged')
       await database.settings.put({ key: entryKey(planId, index), value: entry });
     if (entry.state !== 'pending') return (await getBulkEntryPlan(database))!;
@@ -252,20 +266,20 @@ export async function changeBulkEntry(
   }, database);
 }
 
-/** Each card, its images, queue entry and import progress commit together. */
-export async function saveBulkEntry(
-  plan: BulkEntryPlan,
+type EncodePhoto = (blob: Blob) => Promise<Photo>;
+type PreparedEntry = { index: number; expected: BulkEntry; card: Card; photos: Photo[] };
+
+async function prepareEntry(
+  entry: BulkEntry,
   index: number,
   files: Map<string, File>,
-  database: CabinetDB = db,
-  encode: (blob: Blob) => Promise<Photo> = async (blob) => makePhoto(await transformPhoto(blob)),
-) {
-  const entry = plan.entries[index];
-  if (!entry || entry.state !== 'pending') return plan;
-  let card = structuredClone(entry.card);
+  encode: EncodePhoto,
+): Promise<PreparedEntry> {
+  const expected = structuredClone(entry);
+  const card = structuredClone(expected.card);
   const photos: Photo[] = [];
-  if (entry.sources) {
-    for (const source of entry.sources) {
+  if (expected.sources) {
+    for (const source of expected.sources) {
       const file = files.get(fileKey(source));
       if (!file)
         throw new Error(`Reselect the original photos to continue. Missing file: ${source.name}`);
@@ -273,8 +287,21 @@ export async function saveBulkEntry(
     }
     card.photos = { front: photos[0].hash, back: photos[1].hash };
   }
-  let state: BulkEntry['state'] = 'saved';
-  await database.transaction(
+  return { index, expected, card, photos };
+}
+
+class EntryCommitError extends Error {
+  constructor(
+    message: string,
+    public index: number,
+  ) {
+    super(message);
+  }
+}
+
+/** A card, its photos, sync operation and progress always commit together. */
+async function commitEntries(plan: BulkEntryPlan, prepared: PreparedEntry[], database: CabinetDB) {
+  return database.transaction(
     'rw',
     database.cards,
     database.photos,
@@ -282,48 +309,173 @@ export async function saveBulkEntry(
     database.settings,
     async () => {
       const current = await setting<PlanHeader | null>(bulkEntryKey, null, database);
-      if (!current || current.id !== plan.id)
+      if (!current || current.id !== plan.id || current.kind !== plan.kind)
         throw new Error('This import changed in another tab. Reopen Bulk add.');
-      const currentEntry = await setting<BulkEntry | null>(
-        entryKey(plan.id, index),
-        null,
-        database,
+      const stored = await database.settings.bulkGet(
+        prepared.map(({ index }) => entryKey(plan.id, index)),
       );
-      if (!currentEntry) throw new Error('This import entry is missing. Reopen Bulk add.');
-      if (currentEntry.state !== 'pending') {
-        state = currentEntry.state;
-        card = currentEntry.card;
-        return;
+      const existing = await database.cards.bulkGet(prepared.map(({ card }) => card.id));
+      const baseKeys = new Set<string>();
+      if (plan.kind === 'base')
+        await database.cards.each((card) => {
+          const key = baseCardKey(card);
+          if (key) baseKeys.add(key);
+        });
+      const cards: LocalCard[] = [];
+      const operations: Operation[] = [];
+      const photos = new Map<string, Photo>();
+      const changes = new Map<number, BulkEntry>();
+      const written = new Map<string, LocalCard>();
+      const timestamp = new Date().toISOString();
+      for (const [offset, item] of prepared.entries()) {
+        const currentEntry = stored[offset]?.value as BulkEntry | undefined;
+        if (!currentEntry)
+          throw new EntryCommitError('This import entry is missing. Reopen Bulk add.', item.index);
+        const prior = existing[offset] ?? written.get(item.card.id);
+        const safe = availableEntry(currentEntry, prior);
+        if (safe.state !== 'pending') {
+          changes.set(item.index, safe);
+          continue;
+        }
+        if (
+          !sameCard(currentEntry.card, item.expected.card) ||
+          JSON.stringify(currentEntry.sources) !== JSON.stringify(item.expected.sources)
+        )
+          throw new EntryCommitError(
+            'This card or its photo pairing changed in another tab. Reopen Bulk add before saving it.',
+            item.index,
+          );
+        const card = cardSchema.parse({ ...item.card, updatedAt: timestamp });
+        if (card.status === 'purged') {
+          changes.set(item.index, { card: purgedCard(card), state: 'skipped' });
+          continue;
+        }
+        const key = plan.kind === 'base' ? baseCardKey(card) : null;
+        const state = prior || (key && baseKeys.has(key)) ? 'existing' : 'saved';
+        changes.set(item.index, { ...currentEntry, card: prior ? plainCard(prior) : card, state });
+        if (state === 'existing') continue;
+        const local = { ...card, baseRev: 0, localVersion: 1, syncedVersion: 0 };
+        cards.push(local);
+        written.set(card.id, local);
+        operations.push({
+          id: card.id,
+          mutationId: crypto.randomUUID(),
+          baseRev: 0,
+          version: 1,
+          card,
+        });
+        for (const photo of item.photos) photos.set(photo.hash, photo);
+        if (key) baseKeys.add(key);
       }
-      if (
-        !sameCard(currentEntry.card, entry.card) ||
-        JSON.stringify(currentEntry.sources) !== JSON.stringify(entry.sources)
-      )
-        throw new Error(
-          'This card or its photo pairing changed in another tab. Reopen Bulk add before saving it.',
-        );
-      const existing = await database.cards.get(card.id);
-      if (existing?.status === 'purged' || card.status === 'purged') {
-        card = purgedCard(existing?.status === 'purged' ? existing : card);
-        state = 'skipped';
-        await database.settings.put({ key: entryKey(plan.id, index), value: { card, state } });
-        return;
-      }
-      if (existing) state = 'existing';
-      else if (plan.kind === 'base') {
-        const key = baseCardKey(card);
-        const exists = await database.cards.filter((saved) => baseCardKey(saved) === key).first();
-        if (exists) state = 'existing';
-      }
-      if (state === 'saved') await saveCard(card, photos, database);
-      await database.settings.put({
-        key: entryKey(plan.id, index),
-        value: { ...currentEntry, card, state },
-      });
+      if (photos.size) await database.photos.bulkPut([...photos.values()]);
+      if (cards.length) await database.cards.bulkPut(cards);
+      if (operations.length) await database.queue.bulkPut(operations);
+      await database.settings.bulkPut(
+        [...changes].map(([index, value]) => ({ key: entryKey(plan.id, index), value })),
+      );
+      return changes;
     },
   );
+}
+
+function applyChanges(plan: BulkEntryPlan, changes: Map<number, BulkEntry>): BulkEntryPlan {
   return {
     ...plan,
-    entries: plan.entries.map((item, i) => (i === index ? { ...item, card, state } : item)),
+    entries: plan.entries.map((item, index) => changes.get(index) ?? item),
   };
+}
+
+export async function saveBulkEntry(
+  plan: BulkEntryPlan,
+  index: number,
+  files: Map<string, File>,
+  database: CabinetDB = db,
+  encode: EncodePhoto = async (blob) => makePhoto(await transformPhoto(blob)),
+) {
+  const entry = plan.entries[index];
+  if (!entry || entry.state !== 'pending') return plan;
+  return applyChanges(
+    plan,
+    await commitEntries(plan, [await prepareEntry(entry, index, files, encode)], database),
+  );
+}
+
+export function localImportCapabilities(speed: ProcessingSpeed) {
+  const requestedConcurrency = speedProfiles[normalizeProcessingSpeed(speed)].concurrency;
+  const capabilities = photoProcessingCapabilities();
+  const photoConcurrency = Math.min(requestedConcurrency, capabilities.maxConcurrency);
+  return {
+    requestedConcurrency,
+    photoConcurrency,
+    heicConcurrency: 1 as const,
+    memoryBudgetMiB: capabilities.memoryBudgetMiB,
+    note:
+      photoConcurrency < requestedConcurrency
+        ? `This device supports up to ${photoConcurrency} photo conversions at once. HEIC and large photos stay sequential.`
+        : 'HEIC and large photos stay sequential. JPEG/PNG concurrency adjusts to available memory.',
+  };
+}
+export class BulkSaveError extends Error {
+  constructor(
+    message: string,
+    public plan: BulkEntryPlan,
+    public index: number,
+  ) {
+    super(message);
+    this.name = 'BulkSaveError';
+  }
+}
+export type BulkSaveOptions = {
+  speed: ProcessingSpeed;
+  database?: CabinetDB;
+  signal?: AbortSignal;
+  onProgress?: (plan: BulkEntryPlan, index: number) => void;
+  encode?: EncodePhoto;
+};
+
+/** Abort stops new work. Already-started photos finish, commit and report their progress. */
+export async function saveBulkEntries(
+  plan: BulkEntryPlan,
+  files: Map<string, File>,
+  options: BulkSaveOptions,
+): Promise<BulkEntryPlan> {
+  const database = options.database ?? db;
+  const speed = normalizeProcessingSpeed(options.speed);
+  const concurrency = localImportCapabilities(speed).photoConcurrency;
+  const encode =
+    options.encode ??
+    (async (blob: Blob) =>
+      makePhoto(await transformPhoto(blob, 0, fullCrop, 2560, { concurrency })));
+  let current = { ...plan, entries: [...plan.entries] };
+  const pending = plan.entries
+    .map((entry, index) => (entry.state === 'pending' ? index : -1))
+    .filter((index) => index >= 0);
+  const photoImport = pending.some((index) => !!plan.entries[index].sources);
+  const groupSize = photoImport ? 1 : { normal: 1, fast: 16, ultra: 64 }[speed];
+  let cursor = 0;
+  let failure: { error: unknown; index: number } | undefined;
+  const worker = async () => {
+    while (!failure && !options.signal?.aborted && cursor < pending.length) {
+      const indices = pending.slice(cursor, (cursor += groupSize));
+      const index = indices[0];
+      try {
+        const prepared: PreparedEntry[] = [];
+        for (const position of indices)
+          prepared.push(await prepareEntry(plan.entries[position], position, files, encode));
+        const changes = await commitEntries(plan, prepared, database);
+        current = applyChanges(current, changes);
+        options.onProgress?.(current, indices.at(-1)!);
+      } catch (error) {
+        failure ??= { error, index: error instanceof EntryCommitError ? error.index : index };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: photoImport ? concurrency : 1 }, worker));
+  if (failure)
+    throw new BulkSaveError(
+      failure.error instanceof Error ? failure.error.message : 'The import could not finish.',
+      current,
+      failure.index,
+    );
+  return current;
 }

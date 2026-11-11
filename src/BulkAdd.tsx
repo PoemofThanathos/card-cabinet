@@ -4,6 +4,7 @@ import { friendlyError } from './db';
 import { type Field, categories, fieldLabels, products } from './model';
 import { PairPreview } from './PhotoPreview';
 import { AiPhotoMatch } from './AiPhotoMatch';
+import { SpeedControl, useProcessingSpeed } from './SpeedControl';
 import {
   consumePhotoMatchingPairs,
   getPhotoMatchingJob,
@@ -24,7 +25,9 @@ import {
   numberCount,
   pairPhotos,
   savedEntryIds,
-  saveBulkEntry,
+  saveBulkEntries,
+  localImportCapabilities,
+  BulkSaveError,
   storeBulkEntryPlan,
   changeBulkEntry,
   validateSourceFiles,
@@ -59,6 +62,8 @@ export function BulkAdd({
     [page, setPage] = useState(0);
   const [aiMode, setAiMode] = useState(false),
     [hasAiDraft, setHasAiDraft] = useState(false);
+  const [speed, setSpeed, speedReady] = useProcessingSpeed(setError);
+  const controller = useRef<AbortController | null>(null);
   const paused = useRef(false),
     closeAfter = useRef(false),
     active = useRef(true);
@@ -80,6 +85,7 @@ export function BulkAdd({
     return () => {
       active.current = false;
       paused.current = true;
+      controller.current?.abort();
     };
   }, []);
   const saved = plan ? savedEntryIds(plan) : [];
@@ -163,11 +169,12 @@ export function BulkAdd({
     }
   }
   async function save(identify = false) {
-    if (!plan) return;
+    if (!plan || !speedReady) return;
     setBusy(true);
     setError('');
     paused.current = false;
     let current = plan;
+    controller.current = new AbortController();
     try {
       if (!persisted) {
         await withBulkEntryTransaction(async () => {
@@ -180,26 +187,33 @@ export function BulkAdd({
         });
         setPersisted(true);
       }
-      for (let index = 0; index < current.entries.length; index++) {
-        if (paused.current || !active.current) break;
-        if (current.entries[index].state !== 'pending') continue;
-        try {
-          current = await saveBulkEntry(current, index, fileMap);
-        } catch (e) {
-          setPage(Math.floor(index / pageSize));
-          throw e;
-        }
-        if (active.current) setPlan(current);
-      }
-      if (identify && active.current && !current.entries.some((entry) => entry.state === 'pending'))
+      current = await saveBulkEntries(current, fileMap, {
+        speed,
+        signal: controller.current.signal,
+        onProgress: (next) => {
+          if (active.current) setPlan(next);
+        },
+      });
+      if (active.current) setPlan(current);
+      if (
+        identify &&
+        active.current &&
+        !controller.current.signal.aborted &&
+        !current.entries.some((entry) => entry.state === 'pending')
+      )
         await finish(true, current);
     } catch (e) {
+      if (active.current && e instanceof BulkSaveError) {
+        setPlan(e.plan);
+        setPage(Math.floor(e.index / pageSize));
+      }
       if (active.current)
         setError(
           friendlyError(e) +
             ' Saved cards are kept. Resume after fixing the problem, or skip this card.',
         );
     } finally {
+      controller.current = null;
       if (active.current) setBusy(false);
       if (closeAfter.current) onClose();
     }
@@ -291,6 +305,7 @@ export function BulkAdd({
   function close() {
     if (busy) {
       paused.current = true;
+      controller.current?.abort();
       closeAfter.current = true;
     } else onClose();
   }
@@ -394,8 +409,7 @@ export function BulkAdd({
               <>
                 {chooseFiles}
                 <p className="small muted">
-                  No photo-count cap. Photos are sorted by filename and saved one pair at a time.
-                  Device storage still applies.
+                  No photo-count cap. Photos are sorted by filename. Device storage still applies.
                 </p>
                 <label>
                   Photo order
@@ -508,6 +522,12 @@ export function BulkAdd({
         ) : (
           <>
             {summary && <p>{summary}</p>}
+            {pending > 0 && (
+              <SpeedControl value={speed} onChange={setSpeed} disabled={busy || !speedReady} />
+            )}
+            {pending > 0 && plan.kind === 'photos' && (
+              <p className="small muted">{localImportCapabilities(speed).note}</p>
+            )}
             {plan.kind === 'photos' &&
               saved.length === 0 &&
               existing === 0 &&
@@ -595,13 +615,15 @@ export function BulkAdd({
                 <button
                   onClick={() => {
                     paused.current = true;
+                    controller.current?.abort();
                   }}
                 >
-                  Pause after this card
+                  Pause saving
                 </button>
               ) : pending > 0 ? (
                 <button
                   className="primary"
+                  disabled={!speedReady}
                   onClick={() => void save(Boolean(plan.identifyAfterSaving))}
                 >
                   {plan.identifyAfterSaving
