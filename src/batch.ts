@@ -78,19 +78,53 @@ export async function checkBatchAllowance(count: number, database = db) {
     );
 }
 
-async function checkCards(ids: string[], database: CabinetDB) {
+const unavailableCard = (card: Card | undefined) =>
+  !card || card.status === 'deleted' || card.status === 'purged';
+
+async function scrubBatch(
+  batch: IdentificationBatch,
+  database: CabinetDB,
+): Promise<IdentificationBatch> {
+  const cards = await database.cards.bulkGet(batch.failures.map((failure) => failure.cardId));
+  let removed = false;
+  const failures = batch.failures.map((failure, index) => {
+    if (cards[index]?.status !== 'purged') return failure;
+    removed = true;
+    return {
+      cardId: failure.cardId,
+      name: 'Permanently deleted card',
+      error: 'This card was permanently deleted. Its identification data was removed.',
+    };
+  });
+  return {
+    ...batch,
+    failures,
+    error:
+      removed && batch.error
+        ? 'A card was permanently deleted. Its identification data was removed.'
+        : batch.error,
+  };
+}
+
+async function checkCards(ids: string[], database: CabinetDB, skipUnavailable = false) {
+  let available = 0;
   for (const id of ids) {
     const card = await database.cards.get(id);
-    if (!card || card.status === 'deleted')
+    if (unavailableCard(card)) {
+      if (skipUnavailable) continue;
       throw new Error(
         'A queued card is no longer available. Start a new batch with your current selection.',
       );
+    }
+    if (!card) continue;
+    available++;
     for (const side of ['front', 'back'] as const) {
       const hash = card.photos[side];
       if (!hash || !(await database.photos.get(hash)))
         throw new Error(`${title(card)} needs its ${side} photo on this device.`);
     }
   }
+  return available;
 }
 
 async function photoMatchingLastStart(database: CabinetDB, now: () => number) {
@@ -165,13 +199,17 @@ export async function runBatch(batchId: string, options: Options = {}) {
       throw new Error('The saved batch changed. Reopen it before continuing.');
     const identificationOptions = normalizeIdentificationOptions(saved.identificationOptions);
     let batch: IdentificationBatch = { ...saved, identificationOptions };
-    const save = async () => setSetting(batchKey, batch, database);
+    const save = async () =>
+      database.transaction('rw', database.cards, database.settings, async () => {
+        batch = await scrubBatch(batch, database);
+        await setSetting(batchKey, batch, database);
+      });
     // A stored in-flight request has an unknown outcome after a reload. Never send it again.
     if (batch.processing) {
       const card = await database.cards.get(batch.processing);
       batch.failures.push({
         cardId: batch.processing,
-        name: card ? title(card) : 'Unavailable card',
+        name: card && !unavailableCard(card) ? title(card) : 'Unavailable card',
         error:
           'Interrupted scan. Its outcome is unknown and it may have been billed. It was not retried.',
       });
@@ -189,8 +227,8 @@ export async function runBatch(batchId: string, options: Options = {}) {
       return batch;
     }
     await (options.ready || ready)();
-    await checkBatchAllowance(batch.cardIds.length - batch.position, database);
-    await checkCards(batch.cardIds.slice(batch.position), database);
+    const available = await checkCards(batch.cardIds.slice(batch.position), database, true);
+    await checkBatchAllowance(available, database);
     batch.lastStart = Math.max(batch.lastStart, await photoMatchingLastStart(database, now));
     batch.status = 'running';
     batch.error = '';
@@ -205,16 +243,16 @@ export async function runBatch(batchId: string, options: Options = {}) {
         if (options.signal?.aborted) break;
         const id = batch.cardIds[batch.position];
         const local = await database.cards.get(id);
-        if (!local || local.status === 'deleted') {
+        if (unavailableCard(local)) {
           batch.failures.push({
             cardId: id,
             name: 'Unavailable card',
             error: 'This card was removed before its scan.',
           });
           batch.position++;
-          batch.error = 'A card is no longer available. The batch is paused.';
-          break;
+          continue;
         }
+        if (!local) continue;
         const card = plainCard(local);
         batch.processing = id;
         batch.lastStart = now();
@@ -240,15 +278,26 @@ export async function runBatch(batchId: string, options: Options = {}) {
           lastStart: now(),
         };
         // A result and the next position commit together, so reload cannot lose a completed result.
-        await database.transaction('rw', database.settings, async () => {
-          await setSetting(
-            reviewPrefix + batch!.id + ':' + id,
-            { batchId: batch!.id, card, result, identificationOptions } satisfies BatchReview,
-            database,
-          );
-          await setSetting(batchKey, next, database);
+        await database.transaction('rw', database.cards, database.settings, async () => {
+          const current = await database.cards.get(id);
+          const key = reviewPrefix + batch!.id + ':' + id;
+          if (unavailableCard(current)) {
+            await database.settings.delete(key);
+            next.failures.push({
+              cardId: id,
+              name: 'Unavailable card',
+              error: 'This card was removed during identification. Its suggestions were discarded.',
+            });
+          } else {
+            await setSetting(
+              key,
+              { batchId: batch!.id, card, result, identificationOptions } satisfies BatchReview,
+              database,
+            );
+          }
+          batch = await scrubBatch(next, database);
+          await setSetting(batchKey, batch, database);
         });
-        batch = next;
       }
       batch.status = batch.position >= batch.cardIds.length ? 'complete' : 'paused';
       await save();
@@ -264,6 +313,7 @@ export async function applyBatchReview(
   values: Partial<Card['fields']>,
   database = db,
 ) {
+  let purged = false;
   await database.transaction(
     'rw',
     database.settings,
@@ -274,6 +324,11 @@ export async function applyBatchReview(
       const review = await setting<BatchReview | null>(key, null, database);
       if (!review) throw new Error('These suggestions were already reviewed.');
       const current = await database.cards.get(review.card.id);
+      if (current?.status === 'purged' || review.card.status === 'purged') {
+        await database.settings.delete(key);
+        purged = true;
+        return;
+      }
       if (!current || current.status === 'deleted' || !sameCard(plainCard(current), review.card))
         throw new Error(
           'This card changed after identification. Your current card and saved suggestions are kept. Review the current card before identifying it again.',
@@ -292,4 +347,6 @@ export async function applyBatchReview(
       await database.settings.delete(key);
     },
   );
+  if (purged)
+    throw new Error('This card was permanently deleted. Its saved suggestions were removed.');
 }

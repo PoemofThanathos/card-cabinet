@@ -1,5 +1,5 @@
 import { db, type CabinetDB, type Photo, makePhoto, saveCard, setting } from './db';
-import { type Card, type Field, newCard, cardSchema, sameCard } from './model';
+import { type Card, type Field, newCard, cardSchema, sameCard, purgedCard } from './model';
 import { groupKey } from './groups';
 import { transformPhoto } from './photos';
 
@@ -139,6 +139,7 @@ export function baseCardKey(card: Card) {
   const f = card.fields;
   if (
     card.status === 'deleted' ||
+    card.status === 'purged' ||
     normalized(f.rarity) !== 'base' ||
     !f.cardNumber.trim() ||
     f.autograph.trim() ||
@@ -164,7 +165,9 @@ export function bulkCard(
   return cardSchema.parse(card);
 }
 export function savedEntryIds(plan: BulkEntryPlan) {
-  return plan.entries.filter((entry) => entry.state === 'saved').map((entry) => entry.card.id);
+  return plan.entries
+    .filter((entry) => entry.state === 'saved' && entry.card.status !== 'purged')
+    .map((entry) => entry.card.id);
 }
 type PlanHeader = {
   id: string;
@@ -174,6 +177,16 @@ type PlanHeader = {
 };
 const entryPrefix = (id: string) => `bulkEntry:${id}:`;
 const entryKey = (id: string, index: number) => entryPrefix(id) + String(index).padStart(16, '0');
+/** Bulk progress and purge checks must share the same transaction scope. */
+export function withBulkEntryTransaction<T>(action: () => Promise<T>, database = db) {
+  return database.transaction('rw', database.settings, database.cards, action);
+}
+async function availableEntry(entry: BulkEntry, database: CabinetDB): Promise<BulkEntry> {
+  const current = await database.cards.get(entry.card.id);
+  return current?.status === 'purged' || entry.card.status === 'purged'
+    ? { card: purgedCard(current?.status === 'purged' ? current : entry.card), state: 'skipped' }
+    : entry;
+}
 export async function getBulkEntryPlan(database = db) {
   const header = await setting<PlanHeader | null>(bulkEntryKey, null, database);
   if (!header) return null;
@@ -184,16 +197,17 @@ export async function getBulkEntryPlan(database = db) {
     id: header.id,
     kind: header.kind,
     ...(header.identifyAfterSaving ? { identifyAfterSaving: true } : {}),
-    entries: rows.map((row) => row.value as BulkEntry),
+    entries: await Promise.all(rows.map((row) => availableEntry(row.value as BulkEntry, database))),
   };
 }
 export async function storeBulkEntryPlan(plan: BulkEntryPlan, database = db) {
-  await database.transaction('rw', database.settings, async () => {
+  await withBulkEntryTransaction(async () => {
     const previous = await setting<PlanHeader | null>(bulkEntryKey, null, database);
     if (previous)
       await database.settings.where('key').startsWith(entryPrefix(previous.id)).delete();
+    const entries = await Promise.all(plan.entries.map((entry) => availableEntry(entry, database)));
     await database.settings.bulkPut(
-      plan.entries.map((entry, index) => ({ key: entryKey(plan.id, index), value: entry })),
+      entries.map((entry, index) => ({ key: entryKey(plan.id, index), value: entry })),
     );
     await database.settings.put({
       key: bulkEntryKey,
@@ -204,7 +218,7 @@ export async function storeBulkEntryPlan(plan: BulkEntryPlan, database = db) {
         ...(plan.identifyAfterSaving ? { identifyAfterSaving: true } : {}),
       } satisfies PlanHeader,
     });
-  });
+  }, database);
 }
 export async function deleteBulkEntryPlan(id: string, database = db) {
   await database.transaction('rw', database.settings, async () => {
@@ -221,18 +235,21 @@ export async function changeBulkEntry(
   action: 'swap' | 'skip',
   database = db,
 ) {
-  return database.transaction('rw', database.settings, async () => {
+  return withBulkEntryTransaction(async () => {
     const current = await setting<PlanHeader | null>(bulkEntryKey, null, database);
     if (!current || current.id !== planId)
       throw new Error('This import changed in another tab. Reopen Bulk add.');
-    const entry = await setting<BulkEntry | null>(entryKey(planId, index), null, database);
+    let entry = await setting<BulkEntry | null>(entryKey(planId, index), null, database);
     if (!entry) throw new Error('This import entry is missing. Reopen Bulk add.');
+    entry = await availableEntry(entry, database);
+    if (entry.card.status === 'purged')
+      await database.settings.put({ key: entryKey(planId, index), value: entry });
     if (entry.state !== 'pending') return (await getBulkEntryPlan(database))!;
     if (action === 'skip') entry.state = 'skipped';
     else if (entry.sources) entry.sources = [entry.sources[1], entry.sources[0]];
     await database.settings.put({ key: entryKey(planId, index), value: entry });
     return (await getBulkEntryPlan(database))!;
-  });
+  }, database);
 }
 
 /** Each card, its images, queue entry and import progress commit together. */
@@ -285,7 +302,14 @@ export async function saveBulkEntry(
         throw new Error(
           'This card or its photo pairing changed in another tab. Reopen Bulk add before saving it.',
         );
-      if (await database.cards.get(card.id)) state = 'existing';
+      const existing = await database.cards.get(card.id);
+      if (existing?.status === 'purged' || card.status === 'purged') {
+        card = purgedCard(existing?.status === 'purged' ? existing : card);
+        state = 'skipped';
+        await database.settings.put({ key: entryKey(plan.id, index), value: { card, state } });
+        return;
+      }
+      if (existing) state = 'existing';
       else if (plan.kind === 'base') {
         const key = baseCardKey(card);
         const exists = await database.cards.filter((saved) => baseCardKey(saved) === key).first();

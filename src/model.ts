@@ -53,11 +53,19 @@ export const cardSchema = z
     id: z.uuid(),
     fields: fieldsSchema,
     photos: z.object({ front: hashSchema.nullable(), back: hashSchema.nullable() }).strict(),
-    status: z.enum(['active', 'archived', 'deleted']),
+    status: z.enum(['active', 'archived', 'deleted', 'purged']),
     createdAt: z.iso.datetime(),
     updatedAt: z.iso.datetime(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (card) =>
+      card.status !== 'purged' ||
+      (Object.values(card.fields).every((value) => value === '') &&
+        card.photos.front === null &&
+        card.photos.back === null),
+    'Permanently deleted cards must have no fields or photos.',
+  );
 export type Card = z.infer<typeof cardSchema>;
 export type Draft = { card: Card; base: Card | null };
 export const emptyFields = () =>
@@ -73,13 +81,24 @@ export const newCard = (): Card => ({
 export const sameCard = (a: Card, b: Card) =>
   JSON.stringify([a.id, fields.map((f) => a.fields[f]), a.photos, a.status]) ===
   JSON.stringify([b.id, fields.map((f) => b.fields[f]), b.photos, b.status]);
-export const copyCard = (card: Card): Card => ({
-  ...structuredClone(card),
-  id: crypto.randomUUID(),
-  status: 'active',
-  createdAt: new Date().toISOString(),
+export const purgedCard = (card: Card): Card => ({
+  id: card.id,
+  fields: emptyFields(),
+  photos: { front: null, back: null },
+  status: 'purged',
+  createdAt: card.createdAt,
   updatedAt: new Date().toISOString(),
 });
+export const copyCard = (card: Card): Card => {
+  if (card.status === 'purged') throw new Error('This card was permanently deleted.');
+  return {
+    ...structuredClone(card),
+    id: crypto.randomUUID(),
+    status: 'active',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+};
 export const title = (c: Card) =>
   c.fields.name || c.fields.japaneseName || c.fields.set || 'Untitled card';
 export type LocalCard = Card & { baseRev: number; localVersion: number; syncedVersion: number };

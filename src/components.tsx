@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { X, ImageOff, RotateCw, Camera, Upload, Check, ScanLine } from 'lucide-react';
 import { db, makePhoto, friendlyError, photoBlob } from './db';
@@ -16,14 +16,17 @@ export function Modal({
   wide?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const titleId = useId();
   useEffect(() => {
     const dialog = ref.current!;
     dialog.showModal();
+    dialog.querySelector<HTMLElement>('[data-modal-initial-focus]')?.focus();
     return () => dialog.close();
   }, []);
   return (
     <dialog
       ref={ref}
+      aria-labelledby={titleId}
       className={wide ? 'modal wide' : 'modal'}
       onCancel={(e) => {
         e.preventDefault();
@@ -31,7 +34,7 @@ export function Modal({
       }}
     >
       <div className="modal-heading">
-        <h2>{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         <button className="icon-button" aria-label="Close dialog" onClick={onClose}>
           <X size={21} />
         </button>

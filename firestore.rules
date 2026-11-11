@@ -34,10 +34,11 @@ service cloud.firestore {
       return c is map && c.keys().hasAll(['id','fields','photos','status','createdAt','updatedAt'])
         && c.keys().hasOnly(['id','fields','photos','status','createdAt','updatedAt'])
         && uuid(c.id) && c.id == id && fieldsValid(c.fields)
-        && c.status in ['active','archived','deleted']
+        && c.status in ['active','archived','deleted','purged']
         && c.createdAt is string && c.createdAt.size() <= 30 && c.updatedAt is string && c.updatedAt.size() <= 30
         && c.photos is map && c.photos.keys().hasAll(['front','back']) && c.photos.keys().hasOnly(['front','back'])
-        && hash(c.photos.front) && hash(c.photos.back);
+        && hash(c.photos.front) && hash(c.photos.back)
+        && (c.status != 'purged' || (c.fields.values().hasOnly(['']) && c.photos.front == null && c.photos.back == null));
     }
     function recordValid(r, id) {
       return r.keys().hasAll(['rev','mutationId','card']) && r.keys().hasOnly(['rev','mutationId','card'])
@@ -46,7 +47,8 @@ service cloud.firestore {
     match /users/{uid}/cards/{id} {
       allow read: if owner(uid);
       allow create: if owner(uid) && recordValid(request.resource.data,id) && request.resource.data.rev == 1;
-      allow update: if owner(uid) && recordValid(request.resource.data,id) && request.resource.data.rev == resource.data.rev + 1;
+      allow update: if owner(uid) && recordValid(request.resource.data,id) && request.resource.data.rev == resource.data.rev + 1
+        && (resource.data.card.status != 'purged' || request.resource.data.card.status == 'purged');
       allow delete: if false; // Keep tombstones so an offline device cannot resurrect a deleted record.
     }
     match /users/{uid}/pairings/{id} {

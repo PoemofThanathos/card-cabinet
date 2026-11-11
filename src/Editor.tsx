@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Save, ScanLine, ChevronDown, Check } from 'lucide-react';
+import { useLiveQuery } from 'dexie-react-hooks';
 import {
   type Card,
   type Field,
@@ -116,6 +117,15 @@ export function Editor({
   onSaved: () => void;
   onError: (message: string) => void;
 }) {
+  const savedStatus = useLiveQuery(
+    async () => (await db.cards.get(initial.id))?.status,
+    [initial.id],
+  );
+  useEffect(() => {
+    if (savedStatus !== 'purged') return;
+    outerError('This card was permanently deleted on another tab or device.');
+    onClose();
+  }, [savedStatus, outerError, onClose]);
   const [card, setCard] = useState(initial),
     [busy, setBusy] = useState(false),
     [result, setResult] = useState<Suggestions | null>(null),

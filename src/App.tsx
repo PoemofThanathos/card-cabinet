@@ -25,7 +25,7 @@ import {
   Users,
   ArrowLeft,
 } from 'lucide-react';
-import { db, changeStatus, duplicateCard, friendlyError, setting } from './db';
+import { db, changeStatus, duplicateCard, friendlyError, setting, purgeDeletedCards } from './db';
 import {
   type Card,
   type LocalCard,
@@ -78,7 +78,8 @@ function CardStatus({
   );
 }
 export default function App() {
-  const cards = useLiveQuery(() => db.cards.toArray(), []) || [],
+  const cards =
+      useLiveQuery(() => db.cards.filter((card) => card.status !== 'purged').toArray(), []) || [],
     photos = useLiveQuery(() => db.photos.toCollection().primaryKeys(), []) || [],
     conflicts = useLiveQuery(() => db.conflicts.toArray(), []) || [],
     queue = useLiveQuery(() => db.queue.count(), []) || 0;
@@ -110,7 +111,9 @@ export default function App() {
     [conflictOpen, setConflictOpen] = useState(false),
     [selectedIds, setSelectedIds] = useState<string[]>([]),
     [bulkOpen, setBulkOpen] = useState(false),
-    [batch, setBatch] = useState<Card[] | null>(null);
+    [batch, setBatch] = useState<Card[] | null>(null),
+    [purge, setPurge] = useState<{ ids: string[]; wholeBin: boolean } | null>(null),
+    [purgeError, setPurgeError] = useState('');
   const {
     offlineReady: [offlineReady, setOfflineReady],
     needRefresh: [needRefresh],
@@ -160,6 +163,30 @@ export default function App() {
       setError(friendlyError(e));
     } finally {
       setSyncing(false);
+    }
+  }
+  function confirmPurge(ids: string[], wholeBin: boolean) {
+    setPurgeError('');
+    setDetail(null);
+    setPurge({ ids, wholeBin });
+  }
+  async function permanentlyDelete() {
+    if (!purge || busy) return;
+    setBusy(true);
+    setPurgeError('');
+    try {
+      const count = await purgeDeletedCards(purge.ids);
+      setSelectedIds((ids) => ids.filter((id) => !purge.ids.includes(id)));
+      setPurge(null);
+      setNotice(
+        count
+          ? `${count} ${count === 1 ? 'card' : 'cards'} permanently deleted. Sync to update your other devices.`
+          : 'No cards were deleted. The selected cards were already removed or restored.',
+      );
+    } catch (e) {
+      setPurgeError(friendlyError(e));
+    } finally {
+      setBusy(false);
     }
   }
   function openNew() {
@@ -221,7 +248,7 @@ export default function App() {
   const groups = groupCards(filtered, groupKind, sort);
   const showingGroups = grouped && !openGroup;
   const listView = status === 'active' ? 'list' : view;
-  const allBusy = busy || backupBusy || syncing || !!editor || !!batch || bulkOpen;
+  const allBusy = busy || backupBusy || syncing || !!editor || !!batch || bulkOpen || !!purge;
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -414,18 +441,34 @@ export default function App() {
                         : 'Recently deleted'}
                   </h1>
                   {group?.detail && <p className="group-detail">{group.detail}</p>}
-                  {status === 'deleted' && (
-                    <p>Deleted cards remain recoverable and are included in backups.</p>
-                  )}
+                  {status === 'deleted' && <p>Restore cards here or delete them permanently.</p>}
                 </div>
                 <div className="button-row heading-actions">
-                  <button disabled={allBusy} onClick={() => setBulkOpen(true)}>
-                    Bulk add
-                  </button>
-                  <button className="primary add-button" onClick={openNew}>
-                    <Plus size={19} />
-                    Add a card
-                  </button>
+                  {status === 'deleted' ? (
+                    <button
+                      className="danger-text"
+                      disabled={allBusy || !cards.some((card) => card.status === 'deleted')}
+                      onClick={() =>
+                        confirmPurge(
+                          cards.filter((card) => card.status === 'deleted').map((card) => card.id),
+                          true,
+                        )
+                      }
+                    >
+                      <Trash2 size={18} />
+                      Empty bin
+                    </button>
+                  ) : (
+                    <>
+                      <button disabled={allBusy} onClick={() => setBulkOpen(true)}>
+                        Bulk add
+                      </button>
+                      <button className="primary add-button" onClick={openNew}>
+                        <Plus size={19} />
+                        Add a card
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
               {!openGroup && (
@@ -665,13 +708,26 @@ export default function App() {
                 <section className="empty-state">
                   <BookOpen size={30} aria-hidden="true" />
                   <div className="empty-copy">
-                    <h2>{cards.length ? 'No matching cards' : 'No cards yet'}</h2>
-                    {cards.length > 0 && <p>Try another search or filter.</p>}
-                    <button className="primary" onClick={openNew}>
-                      <Plus size={18} />
-                      Add your {cards.length ? 'next' : 'first'} card
-                    </button>
-                    <span className="small muted">Manual entry works offline.</span>
+                    <h2>
+                      {status === 'deleted' && !cards.some((card) => card.status === 'deleted')
+                        ? 'Bin is empty'
+                        : cards.length
+                          ? 'No matching cards'
+                          : 'No cards yet'}
+                    </h2>
+                    {cards.length > 0 &&
+                      (status !== 'deleted' || cards.some((card) => card.status === 'deleted')) && (
+                        <p>Try another search or filter.</p>
+                      )}
+                    {status !== 'deleted' && (
+                      <>
+                        <button className="primary" onClick={openNew}>
+                          <Plus size={18} />
+                          Add your {cards.length ? 'next' : 'first'} card
+                        </button>
+                        <span className="small muted">Manual entry works offline.</span>
+                      </>
+                    )}
                   </div>
                 </section>
               )}
@@ -788,7 +844,16 @@ export default function App() {
                   Restore to collection
                 </button>
               )}
-              {selected.status !== 'deleted' && (
+              {selected.status === 'deleted' ? (
+                <button
+                  className="danger-text"
+                  disabled={allBusy}
+                  onClick={() => confirmPurge([selected.id], false)}
+                >
+                  <Trash2 size={16} />
+                  Delete permanently
+                </button>
+              ) : (
                 <button
                   className="danger-text"
                   onClick={() =>
@@ -803,6 +868,39 @@ export default function App() {
                 </button>
               )}
             </div>
+          </div>
+        </Modal>
+      )}
+      {purge && (
+        <Modal
+          title={purge.wholeBin ? 'Empty bin?' : 'Delete permanently?'}
+          onClose={() => {
+            if (!busy) setPurge(null);
+          }}
+        >
+          <p>
+            Permanently delete {purge.ids.length} {purge.ids.length === 1 ? 'card' : 'cards'} and
+            their photos? Photos used by other cards are kept. This cannot be undone.
+          </p>
+          <p className="small">
+            Deletion reaches your other devices when they sync. Existing backup files are unchanged.
+          </p>
+          {purgeError && (
+            <p className="notice warning" role="alert">
+              {purgeError}
+            </p>
+          )}
+          <div className="modal-footer">
+            <button data-modal-initial-focus disabled={busy} onClick={() => setPurge(null)}>
+              Cancel
+            </button>
+            <button
+              className="danger-button"
+              disabled={busy}
+              onClick={() => void permanentlyDelete()}
+            >
+              {busy ? 'Deleting…' : purge.wholeBin ? 'Empty bin' : 'Delete permanently'}
+            </button>
           </div>
         </Modal>
       )}

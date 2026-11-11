@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { CabinetDB, makePhoto, saveCard } from '../src/db';
+import { CabinetDB, makePhoto, saveCard, setSetting } from '../src/db';
 import {
   type BulkEntryPlan,
   baseCardKey,
@@ -17,7 +17,16 @@ import {
   storeBulkEntryPlan,
   changeBulkEntry,
   validateSourceFiles,
+  withBulkEntryTransaction,
+  deleteBulkEntryPlan,
 } from '../src/bulk-entry';
+import {
+  consumePhotoMatchingPairs,
+  getPhotoMatchingJob,
+  photoMatchingKey,
+  type PhotoMatchingJob,
+} from '../src/photo-matching';
+import { defaultIdentificationOptions } from '../src/ai-options';
 
 let database: CabinetDB;
 beforeEach(() => {
@@ -40,6 +49,59 @@ const makePlan = (kind: BulkEntryPlan['kind'], numbers: string[]): BulkEntryPlan
     card: bulkCard(common, { cardNumber }, kind === 'base'),
     state: 'pending',
   })),
+});
+
+it('saves and finishes a manual import through the same transaction boundary as the UI', async () => {
+  let plan = makePlan('manual', ['1', '2']);
+  await withBulkEntryTransaction(async () => {
+    expect(await getBulkEntryPlan(database)).toBeNull();
+    await storeBulkEntryPlan(plan, database);
+  }, database);
+  for (let index = 0; index < plan.entries.length; index++)
+    plan = await saveBulkEntry(plan, index, new Map(), database);
+  await withBulkEntryTransaction(async () => {
+    const latest = (await getBulkEntryPlan(database))!;
+    expect(latest.entries.map((entry) => entry.state)).toEqual(['saved', 'saved']);
+    await deleteBulkEntryPlan(latest.id, database);
+  }, database);
+  expect(await getBulkEntryPlan(database)).toBeNull();
+  expect(await database.cards.count()).toBe(2);
+});
+
+it('commits reviewed AI pairs and the bulk draft together, including rollback on a failed handoff', async () => {
+  const sources = [new File(['front'], 'front.jpg'), new File(['back'], 'back.jpg')].map(
+    fileReference,
+  );
+  const pairs: [(typeof sources)[number], (typeof sources)[number]][] = [[sources[0], sources[1]]];
+  const job: PhotoMatchingJob = {
+    version: 1,
+    id: crypto.randomUUID(),
+    files: sources,
+    cursor: 2,
+    processing: null,
+    status: 'complete',
+    lastAttemptAt: 0,
+    notBefore: 0,
+    results: {},
+    error: '',
+    identificationOptions: defaultIdentificationOptions,
+  };
+  await setSetting(photoMatchingKey, job, database);
+  const plan = makePlan('photos', ['1']);
+  plan.entries[0].sources = pairs[0];
+  const handoff = async (fail: boolean) =>
+    withBulkEntryTransaction(async () => {
+      expect(await getBulkEntryPlan(database)).toBeNull();
+      await storeBulkEntryPlan(plan, database);
+      await consumePhotoMatchingPairs(job.id, pairs, database);
+      if (fail) throw new Error('Interrupted handoff');
+    }, database);
+  await expect(handoff(true)).rejects.toThrow('Interrupted handoff');
+  expect(await getBulkEntryPlan(database)).toBeNull();
+  expect((await getPhotoMatchingJob(database))?.id).toBe(job.id);
+  await handoff(false);
+  expect((await getBulkEntryPlan(database))?.entries[0].sources).toEqual(pairs[0]);
+  expect(await getPhotoMatchingJob(database)).toBeNull();
 });
 
 it('pairs more than 100 photos in natural filename order without a count cap', () => {

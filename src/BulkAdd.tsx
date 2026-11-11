@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Modal } from './components';
-import { db, friendlyError } from './db';
+import { friendlyError } from './db';
 import { type Field, categories, fieldLabels, products } from './model';
 import { PairPreview } from './PhotoPreview';
 import { AiPhotoMatch } from './AiPhotoMatch';
@@ -29,6 +29,7 @@ import {
   changeBulkEntry,
   validateSourceFiles,
   deleteBulkEntryPlan,
+  withBulkEntryTransaction,
 } from './bulk-entry';
 import './bulk.css';
 
@@ -169,7 +170,7 @@ export function BulkAdd({
     let current = plan;
     try {
       if (!persisted) {
-        await db.transaction('rw', db.settings, async () => {
+        await withBulkEntryTransaction(async () => {
           const previous = await getBulkEntryPlan();
           if (previous && previous.id !== plan.id)
             throw new Error(
@@ -232,7 +233,7 @@ export function BulkAdd({
     try {
       let ids = savedEntryIds(finished);
       if (persisted || completedPlan)
-        await db.transaction('rw', db.settings, async () => {
+        await withBulkEntryTransaction(async () => {
           const latest = await getBulkEntryPlan();
           if (latest?.id !== finished.id)
             throw new Error('This import changed in another tab. Reopen Bulk add.');
@@ -262,7 +263,7 @@ export function BulkAdd({
         })),
       ],
     };
-    await db.transaction('rw', db.settings, async () => {
+    await withBulkEntryTransaction(async () => {
       const previous = await getBulkEntryPlan();
       if (
         previous &&

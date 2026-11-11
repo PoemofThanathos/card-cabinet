@@ -5,6 +5,7 @@ Updated 11 November 2026. Automated tests use generated fixtures, fake credentia
 ## Implemented
 
 - Offline collection with a set grid, a card list inside each set, an All cards list and a player grid. Manual entry, edit, physical-copy duplication, archive, recoverable deletion, search and filters remain available.
+- Recently deleted includes Empty bin and individual Delete permanently controls, with confirmation, snapshot checks, shared-photo retention and terminal sync records. Purged cards leave exports and cannot be restored by stale edits, import plans or AI results. An old backup offers an explicit new copy instead.
 - Twelve fictional test cards with generated front/back artwork, available from Settings. Adding examples preserves existing records and does not overwrite edited or deleted examples. Remove test cards moves originals and marked copies to Recently deleted while retaining their photos and sync history.
 - Front/back camera inputs and file-picker fallback, rotation, crop, local JPEG encoding and explicit missing-photo status.
 - A local HEIC/HEIF fallback decoder, loaded when native decoding fails, with serialized conversion and bounded preview caching. Decode errors replace the loading placeholder without hiding a readable second photo.
@@ -24,6 +25,10 @@ Updated 11 November 2026. Automated tests use generated fixtures, fake credentia
 - Simplified UI copy and compact desktop/mobile empty states as requested.
 
 ## Automated checks
+
+The 11 November Empty bin revision passed **223 unit/integration tests, 37 browser checks across Chromium and WebKit, 7 Firestore emulator tests, and the TypeScript/Vite build**. The existing Windows WebKit offline-decoder check remains intentionally skipped. The browser run caught bulk-import transaction scope and confirmation-focus regressions, which were fixed. A test fixture also raced database initialization; after fixing its readiness check, all 14 batch/bin browser cases passed. Desktop and iPhone-size bin screenshots were reviewed.
+
+Deletion tests cover cancellation, individual removal, filtered bins, cards restored after confirmation opens, new deletions outside the confirmed selection, shared photos, atomic rollback, queued offline deletion, stale devices, in-flight sync, incomplete cloud pulls, drafts open in another tab, backup import/export, bulk imports, AI reviews and transfers. Permanent deletion was tested only in isolated local collections, mocked cloud stores and the emulator. No live user cards were purged.
 
 The 11 November photo-matching revision passed **191 unit/integration tests, 29 browser checks across Chromium and WebKit, and the TypeScript/Vite build**. One WebKit offline-decoder check is intentionally skipped because the Windows test runtime does not support that service-worker scenario. Chromium covers offline first-use HEIC conversion. The build and browser tests use the `/card-cabinet/` project subpath. Mobile screenshots were reviewed. Browser tests use isolated local collections and mocked identification results. All twelve model/reasoning combinations are covered by mocked Worker requests. Persistence, request snapshots, legacy batches, invalid options and interruption timing are also covered.
 
@@ -61,6 +66,8 @@ The live app was opened in Brave. Adding test cards created 12 cards with 24 ima
 Firebase is configured on the no-cost Spark plan for project `card-cabinet-a1d92`. The web app, personal email/password account, authorized GitHub Pages domain, Firestore Standard database in São Paulo and card-field index exemption were created. Owner-only rules were published after all five Firestore emulator tests passed against the configured rules. The tests now read the configured UID and exercise the actual rules without replacing their access condition. An unauthenticated read of the live database returned HTTP 403.
 
 The GitHub Actions variables include the public Firebase configuration and owner UID.
+
+On 11 November 2026, the terminal-purge rules were published through the signed-in Firebase console after all seven emulator tests passed. Purged records must contain blank fields and no photo references, and cannot change back to an active, archived or recoverable deleted card. Owner access remains unchanged.
 
 On 10 November 2026, the owner signed in to the published app and confirmed linking the local collection. Sync now completed successfully against Firestore. All 12 fictional cards showed Synced, and the pending metadata count fell from 12 to zero. After a page reload, the collection still contained 12 cards and 24 local photos, with zero pending metadata changes. Photos were not uploaded.
 

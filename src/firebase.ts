@@ -54,9 +54,10 @@ export function cloudStore(uid: string): CloudStore {
       return runTransaction(fs, async (tx) => {
         const snap = await tx.get(ref);
         const remote = snap.exists() ? remoteSchema.parse(snap.data()) : undefined;
+        if (remote?.card.status === 'purged') return { ok: op.card.status === 'purged', remote };
         if (remote?.mutationId === op.mutationId || (remote && sameCard(remote.card, op.card)))
           return { ok: true, remote };
-        if ((remote?.rev ?? 0) !== op.baseRev) {
+        if (op.card.status !== 'purged' && (remote?.rev ?? 0) !== op.baseRev) {
           if (!remote)
             throw new Error(
               'Remote record was removed outside the app. Restore from backup or investigate before syncing.',

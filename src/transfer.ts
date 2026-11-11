@@ -8,8 +8,8 @@ import {
   Timestamp,
 } from 'firebase/firestore';
 import { auth, firestore } from './firebase';
-import { PACKAGE_LIMIT } from './backup';
-import { photoHash } from './db';
+import { PACKAGE_LIMIT, assertExportAvailable } from './backup';
+import { photoHash, db, type CabinetDB } from './db';
 
 const CHUNK = 16 * 1024;
 export class PhotoTransfer {
@@ -133,14 +133,25 @@ export class PhotoTransfer {
       tx.update(this.room!, { answer: this.pc.localDescription!.sdp });
     });
   }
-  async send(blob: Blob) {
+  async send(blob: Blob, cardIds: string[], database: CabinetDB = db) {
     const channel = this.channel;
     if (!channel || channel.readyState !== 'open')
       throw new Error('Wait for both devices to connect.');
     if (blob.size > PACKAGE_LIMIT + 1024 * 1024)
       throw new Error('Transfer is limited to a 200 MB package. Export a smaller selection.');
-    channel.send(JSON.stringify({ kind: 'start', size: blob.size, hash: await photoHash(blob) }));
+    const check = async () => {
+      try {
+        await assertExportAvailable(cardIds, database);
+      } catch (error) {
+        await this.close();
+        throw error;
+      }
+    };
+    const hash = await photoHash(blob);
+    await check();
+    channel.send(JSON.stringify({ kind: 'start', size: blob.size, hash }));
     for (let offset = 0; offset < blob.size; offset += CHUNK) {
+      if (offset > 0 && offset % (256 * 1024) === 0) await check();
       if (channel.bufferedAmount > 256 * 1024)
         await new Promise<void>((resolve, reject) => {
           const done = () => {
@@ -161,6 +172,7 @@ export class PhotoTransfer {
         'Sending ' + Math.round((Math.min(offset + CHUNK, blob.size) / blob.size) * 100) + '%',
       );
     }
+    await check();
     channel.send(JSON.stringify({ kind: 'end' }));
     this.status('Sent. Waiting for the receiving device to verify the package.');
   }

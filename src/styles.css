@@ -91,6 +91,14 @@ summary:focus-visible {
 .danger-text {
   color: #a54336;
 }
+.danger-button {
+  background: #a54336;
+  border-color: #a54336;
+  color: #fff;
+}
+.danger-button:hover {
+  background: #87372c;
+}
 a {
   color: var(--green);
   text-underline-offset: 3px;

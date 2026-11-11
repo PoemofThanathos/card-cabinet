@@ -16,7 +16,8 @@ vi.mock('firebase/firestore', () => ({
   runTransaction: vi.fn(),
 }));
 import { PhotoTransfer } from '../src/transfer';
-import { photoHash } from '../src/db';
+import { photoHash, CabinetDB, saveCard, purgeDeletedCards } from '../src/db';
+import { newCard } from '../src/model';
 class Channel {
   readyState = 'open';
   bufferedAmount = 0;
@@ -82,7 +83,7 @@ describe('direct transfer protocol with mocked signaling', () => {
     const transfer = new PhotoTransfer(vi.fn(), complete);
     await transfer.offer();
     const blob = new Blob([new Uint8Array(45000).fill(42)]);
-    await transfer.send(blob);
+    await transfer.send(blob, []);
     const sent = channel.messages.slice();
     expect(
       (sent.filter((m) => m instanceof ArrayBuffer) as ArrayBuffer[]).every(
@@ -106,6 +107,25 @@ describe('direct transfer protocol with mocked signaling', () => {
     await vi.waitFor(() => expect(channel.readyState).toBe('closed'));
     expect(complete).not.toHaveBeenCalled();
     expect(status).toHaveBeenCalledWith(expect.stringContaining('Nothing was imported'));
+  });
+  it('closes without sending a prepared package after one of its cards is purged', async () => {
+    vi.stubGlobal('RTCPeerConnection', Peer);
+    const database = new CabinetDB('transfer-purge-' + crypto.randomUUID());
+    const transfer = new PhotoTransfer(vi.fn(), vi.fn());
+    try {
+      const card = { ...newCard(), status: 'deleted' as const };
+      await saveCard(card, [], database);
+      await purgeDeletedCards([card.id], database);
+      await transfer.offer();
+      await expect(transfer.send(new Blob(['old package']), [card.id], database)).rejects.toThrow(
+        'permanently deleted',
+      );
+      expect(channel.messages).toEqual([]);
+      expect(channel.readyState).toBe('closed');
+    } finally {
+      await transfer.close();
+      await database.delete();
+    }
   });
   it('expires pairing while idle and releases the connection', async () => {
     vi.useFakeTimers();

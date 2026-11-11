@@ -10,6 +10,8 @@ import {
   applyImport,
   type ImportPackage,
   type ImportRow,
+  exportableCards,
+  assertExportAvailable,
 } from './backup';
 import { friendlyError, setSetting } from './db';
 import { PhotoTransfer } from './transfer';
@@ -77,11 +79,13 @@ export function ImportReview({
               <strong>{title(row.card)}</strong>
               <span className="small muted">
                 {row.card.status} ·{' '}
-                {row.kind === 'same'
-                  ? 'Already here, photos will be restored'
-                  : row.kind === 'new'
-                    ? 'New physical copy'
-                    : 'Different metadata, review below'}
+                {row.kind === 'purged'
+                  ? 'Permanently deleted here. Skipped unless imported as a new copy.'
+                  : row.kind === 'same'
+                    ? 'Already here, photos will be restored'
+                    : row.kind === 'new'
+                      ? 'New physical copy'
+                      : 'Different metadata, review below'}
               </span>
               {row.kind === 'different' && (
                 <details>
@@ -117,7 +121,7 @@ export function ImportReview({
                 </details>
               )}
             </div>
-            {row.kind === 'different' && (
+            {(row.kind === 'different' || row.kind === 'purged') && (
               <select
                 aria-label={'Import choice for ' + title(row.card)}
                 value={row.choice}
@@ -129,9 +133,15 @@ export function ImportReview({
                   )
                 }
               >
-                <option value="keep">Keep this device's card</option>
-                <option value="replace">Use backup's metadata</option>
-                <option value="copy">Keep both as separate copies</option>
+                <option value="keep">
+                  {row.kind === 'purged'
+                    ? 'Skip permanently deleted card'
+                    : "Keep this device's card"}
+                </option>
+                {row.kind !== 'purged' && <option value="replace">Use backup's metadata</option>}
+                <option value="copy">
+                  {row.kind === 'purged' ? 'Import as a new copy' : 'Keep both as separate copies'}
+                </option>
               </select>
             )}
           </div>
@@ -168,7 +178,18 @@ export function Backups({
     [joinCode, setJoinCode] = useState(''),
     [status, setStatus] = useState('No connection');
   const transfer = useRef<PhotoTransfer | null>(null);
+  const preparedIds = useRef<string[]>([]);
+  const preparedVersion = useRef<string | null>(null);
   const input = useRef<HTMLInputElement>(null);
+  const visibleCards = cards.filter((card) => card.status !== 'purged');
+  const collectionVersion = cards
+    .map((card) => `${card.id}:${card.status}:${card.updatedAt}`)
+    .join('|');
+  useEffect(() => {
+    setReady(null);
+    preparedIds.current = [];
+    preparedVersion.current = null;
+  }, [collectionVersion]);
   useEffect(
     () => () => {
       void transfer.current?.close();
@@ -182,7 +203,11 @@ export function Backups({
   async function prepare() {
     setBusy(true);
     try {
-      setReady(await exportPackage(cards));
+      const selected = await exportableCards(cards);
+      const prepared = await exportPackage(selected);
+      preparedIds.current = selected.map((card) => card.id);
+      preparedVersion.current = collectionVersion;
+      setReady(prepared);
       onMessage('Backup prepared. Save or share it below.');
     } catch (e) {
       onError(friendlyError(e));
@@ -205,6 +230,13 @@ export function Backups({
   async function save(share = false) {
     if (!ready) return;
     try {
+      if (preparedVersion.current !== collectionVersion)
+        throw new Error(
+          'The collection changed. Prepare a new backup before saving or sharing it.',
+        );
+      // iPhone sharing must reach navigator.share in the original tap, before an IndexedDB await.
+      // Preparation checks permanent deletions; collection changes invalidate the prepared file.
+      if (!share) await assertExportAvailable(preparedIds.current);
       await download(
         ready,
         'card-cabinet-' + new Date().toISOString().slice(0, 10) + '.cardcabinet.zip',
@@ -216,6 +248,17 @@ export function Backups({
       );
     } catch (e) {
       if ((e as Error).name !== 'AbortError') onError(friendlyError(e));
+    }
+  }
+  async function saveCsv() {
+    try {
+      const current = await exportableCards(cards);
+      await download(
+        new Blob([csvExport(current)], { type: 'text/csv;charset=utf-8' }),
+        'card-cabinet.csv',
+      );
+    } catch (error) {
+      onError(friendlyError(error));
     }
   }
   async function pair(join = false) {
@@ -250,8 +293,8 @@ export function Backups({
           <Download size={26} />
           <h2>Export backup</h2>
           <p>
-            Prepare a ZIP with all {cards.length} cards, including archived and deleted cards, plus
-            the photos stored here. No credentials or app settings are included.
+            Prepare a ZIP with all {visibleCards.length} cards, including archived and recently
+            deleted cards, plus the photos stored here. No credentials or app settings are included.
           </p>
           <p className="small muted">
             Up to 200 MB per package. For larger collections, export filtered groups from the
@@ -277,16 +320,7 @@ export function Backups({
           <p className="small muted">
             CSV includes Unicode text and photo hashes. It does not include photos.
           </p>
-          <button
-            onClick={() =>
-              void download(
-                new Blob([csvExport(cards)], { type: 'text/csv;charset=utf-8' }),
-                'card-cabinet.csv',
-              ).catch((e) => onError(friendlyError(e)))
-            }
-          >
-            Export CSV
-          </button>
+          <button onClick={() => void saveCsv()}>Export CSV</button>
         </section>
         <section className="panel">
           <Upload size={26} />
@@ -379,13 +413,19 @@ export function Backups({
             className="primary"
             disabled={!ready || !code}
             onClick={() => {
+              if (preparedVersion.current !== collectionVersion) {
+                onError('The collection changed. Prepare a new backup before sending it.');
+                return;
+              }
               if (
                 ready &&
                 confirm(
                   'Send the prepared backup, including its photos and purchase details, to the paired device?',
                 )
               )
-                void transfer.current?.send(ready).catch((e) => onError(friendlyError(e)));
+                void transfer.current
+                  ?.send(ready, preparedIds.current)
+                  .catch((e) => onError(friendlyError(e)));
             }}
           >
             Send prepared package

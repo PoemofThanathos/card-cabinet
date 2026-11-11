@@ -16,7 +16,7 @@ import {
   Timestamp,
 } from 'firebase/firestore';
 import { readFileSync } from 'node:fs';
-import { newCard } from '../src/model';
+import { newCard, purgedCard } from '../src/model';
 const rules = readFileSync('firestore.rules', 'utf8');
 const ownerUid = rules.match(/&& uid == '([^']+)'/)?.[1];
 if (!ownerUid) throw new Error('The rules must declare one configured owner UID.');
@@ -89,6 +89,46 @@ it('accepts Japanese fields and hash references only', async () => {
       r,
     ),
   );
+});
+it('keeps permanent deletion terminal and allows only blank tombstones', async () => {
+  const r = record();
+  r.card.fields.name = 'Private card name';
+  r.card.photos.front = 'a'.repeat(64);
+  const ref = doc(
+    env.authenticatedContext(ownerUid).firestore(),
+    `users/${ownerUid}/cards/` + r.card.id,
+  );
+  await assertSucceeds(setDoc(ref, r));
+  await assertFails(updateDoc(ref, { rev: 2, 'card.status': 'purged' }));
+  const tombstone = purgedCard(r.card);
+  await assertFails(
+    updateDoc(ref, {
+      rev: 2,
+      card: { ...tombstone, fields: { ...tombstone.fields, notes: 'retained' } },
+    }),
+  );
+  await assertFails(
+    updateDoc(ref, {
+      rev: 2,
+      card: { ...tombstone, photos: { front: 'a'.repeat(64), back: null } },
+    }),
+  );
+  await assertSucceeds(updateDoc(ref, { rev: 2, card: tombstone }));
+  for (const status of ['active', 'archived', 'deleted'])
+    await assertFails(updateDoc(ref, { rev: 3, card: { ...r.card, status } }));
+  await assertFails(deleteDoc(ref));
+  await assertSucceeds(updateDoc(ref, { rev: 3, card: tombstone }));
+  expect((await getDoc(ref)).data()?.card).toEqual(tombstone);
+});
+it('allows an offline card to first sync as a blank permanent deletion', async () => {
+  const r = record();
+  const tombstone = { ...r, card: purgedCard(r.card) };
+  const ref = doc(
+    env.authenticatedContext(ownerUid).firestore(),
+    `users/${ownerUid}/cards/` + r.card.id,
+  );
+  await assertSucceeds(setDoc(ref, tombstone));
+  await assertFails(updateDoc(ref, { rev: 2, card: r.card }));
 });
 it('expires authenticated signaling and permits only one answer', async () => {
   const fs = env.authenticatedContext(ownerUid).firestore();

@@ -57,6 +57,8 @@ test('saved batch review survives closing and discards only on explicit action',
 }, testInfo) => {
   await page.goto('./');
   await expect(page.getByRole('heading', { name: 'Your collection', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Add test cards', exact: true })).toBeEnabled();
   const card = newCard();
   card.fields.name = 'Batch test card';
   const batchId = 'test-batch';
