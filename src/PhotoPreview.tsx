@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { friendlyError } from './db';
-import { fullCrop, transformPhoto } from './photos';
+import { croppedPreview } from './photo-display';
 import { fileKey, type FileReference } from './bulk-entry';
 
 export function PhotoPreview({
@@ -20,7 +20,7 @@ export function PhotoPreview({
     setUrl('');
     setError('');
     if (file)
-      void transformPhoto(file, 0, fullCrop, 480)
+      void croppedPreview(file, 800)
         .then((photo) => {
           if (cancelled) return;
           created = URL.createObjectURL(photo);

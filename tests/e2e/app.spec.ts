@@ -18,11 +18,13 @@ test('set grid, all-card list and player grid with persistent test cards', async
   await page.screenshot({ path: testInfo.outputPath('sets.png'), fullPage: true });
   await page
     .getByRole('button', {
-      name: 'Open set NPB sample series, 2024 · BBM · Baseball card',
+      name: 'Open set 2024 BBM NPB sample series · Unclassified, Japanese baseball',
       exact: true,
     })
     .click();
-  await expect(page.getByRole('heading', { name: 'NPB sample series', exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: '2024 BBM NPB sample series · Unclassified', exact: true }),
+  ).toBeVisible();
   await expect(page.locator('.collection.list .collection-card')).toHaveCount(2);
   await expect(page.getByRole('button', { name: 'Open Shohei Ohtani', exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('set-list.png'), fullPage: true });

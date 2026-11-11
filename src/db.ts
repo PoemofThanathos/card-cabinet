@@ -14,10 +14,21 @@ import {
 } from './model';
 
 export type Photo = { hash: string; bytes: ArrayBuffer; type: string; size: number };
+export type PhotoDisplay = {
+  hash: string;
+  version: 1;
+  mode: 'auto' | 'original' | 'manual';
+  rotation: number;
+  crop: { left: number; top: number; right: number; bottom: number };
+  bytes?: ArrayBuffer;
+  type?: string;
+  updatedAt: number;
+};
 export const photoBlob = (photo: Photo) => new Blob([photo.bytes], { type: photo.type });
 export class CabinetDB extends Dexie {
   cards!: EntityTable<LocalCard, 'id'>;
   photos!: EntityTable<Photo, 'hash'>;
+  photoDisplays!: EntityTable<PhotoDisplay, 'hash'>;
   queue!: EntityTable<Operation, 'id'>;
   conflicts!: EntityTable<Conflict, 'id'>;
   settings!: EntityTable<{ key: string; value: unknown }, 'key'>;
@@ -52,6 +63,7 @@ export class CabinetDB extends Dexie {
           }
         }
       });
+    this.version(4).stores({ photoDisplays: 'hash,updatedAt' });
   }
 }
 export const db = new CabinetDB();
@@ -78,7 +90,8 @@ export async function setSetting(key: string, value: unknown, database = db) {
 export async function saveCard(input: Card, photos: Photo[] = [], database = db, expected?: Card) {
   const card = cardSchema.parse({ ...input, updatedAt: new Date().toISOString() });
   const tables: Table[] = [database.cards, database.photos, database.queue];
-  if (card.status === 'purged') tables.push(database.settings, database.conflicts);
+  if (card.status === 'purged')
+    tables.push(database.settings, database.conflicts, database.photoDisplays);
   await database.transaction('rw', tables, async () => {
     const old = await database.cards.get(card.id);
     if (old?.status === 'purged') {
@@ -212,14 +225,23 @@ async function deleteUnreferencedPhotos(candidates: Set<string>, database: Cabin
   await database.queue.each((operation) => collectPhotoReferences(operation, referenced));
   await database.settings.each((row) => collectPhotoReferences(row.value, referenced));
   await database.conflicts.each((conflict) => collectPhotoReferences(conflict, referenced));
-  await database.photos.bulkDelete([...candidates].filter((hash) => !referenced.has(hash)));
+  const unused = [...candidates].filter((hash) => !referenced.has(hash));
+  await database.photos.bulkDelete(unused);
+  await database.photoDisplays.bulkDelete(unused);
 }
 
 /** Finalize remote photo cleanup only after a complete successful cloud pull. */
 export async function collectPurgedPhotos(database: CabinetDB = db) {
   await database.transaction(
     'rw',
-    [database.cards, database.photos, database.queue, database.settings, database.conflicts],
+    [
+      database.cards,
+      database.photos,
+      database.queue,
+      database.settings,
+      database.conflicts,
+      database.photoDisplays,
+    ],
     async () => {
       const candidates = await setting<string[]>(purgePhotoCandidatesKey, [], database);
       if (!candidates.length) return;
@@ -232,7 +254,14 @@ export async function collectPurgedPhotos(database: CabinetDB = db) {
 export async function purgeDeletedCards(ids: string[], database: CabinetDB = db): Promise<number> {
   return database.transaction(
     'rw',
-    [database.cards, database.photos, database.queue, database.settings, database.conflicts],
+    [
+      database.cards,
+      database.photos,
+      database.queue,
+      database.settings,
+      database.conflicts,
+      database.photoDisplays,
+    ],
     async () => {
       const cards = (await database.cards.bulkGet([...new Set(ids)])).filter(
         (card): card is LocalCard => card?.status === 'deleted',
@@ -278,7 +307,14 @@ export async function acceptRemotePurge(
   const card = cardSchema.parse(remote.card);
   await database.transaction(
     'rw',
-    [database.cards, database.photos, database.queue, database.settings, database.conflicts],
+    [
+      database.cards,
+      database.photos,
+      database.queue,
+      database.settings,
+      database.conflicts,
+      database.photoDisplays,
+    ],
     async () => {
       const local = await database.cards.get(card.id);
       const candidates = new Set<string>();

@@ -40,7 +40,14 @@ export async function syncCollection(cloud: CloudStore, uid: string, database: C
       let retryPurge = false;
       await database.transaction(
         'rw',
-        [database.cards, database.photos, database.queue, database.conflicts, database.settings],
+        [
+          database.cards,
+          database.photos,
+          database.queue,
+          database.conflicts,
+          database.settings,
+          database.photoDisplays,
+        ],
         async () => {
           if (result.remote.card.status === 'purged') {
             await acceptRemotePurge(result.remote, database, true);
@@ -76,7 +83,14 @@ export async function syncCollection(cloud: CloudStore, uid: string, database: C
   for await (const remote of cloud.list()) {
     await database.transaction(
       'rw',
-      [database.cards, database.photos, database.queue, database.conflicts, database.settings],
+      [
+        database.cards,
+        database.photos,
+        database.queue,
+        database.conflicts,
+        database.settings,
+        database.photoDisplays,
+      ],
       async () => {
         if (remote.card.status === 'purged') {
           await acceptRemotePurge(remote, database, true);
@@ -122,7 +136,14 @@ export async function resolveConflict(
 ) {
   await database.transaction(
     'rw',
-    [database.cards, database.photos, database.queue, database.conflicts, database.settings],
+    [
+      database.cards,
+      database.photos,
+      database.queue,
+      database.conflicts,
+      database.settings,
+      database.photoDisplays,
+    ],
     async () => {
       const conflict = await database.conflicts.get(id);
       const local = await database.cards.get(id);

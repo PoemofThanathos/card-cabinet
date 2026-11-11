@@ -492,6 +492,79 @@ describe('durable usage limits', () => {
   );
 });
 describe('mocked OpenAI structured outputs', () => {
+  it('requires identity evidence before rejecting photographic backs or a one-sided serial', async () => {
+    const fetcher = vi.fn(async (_url: unknown, _options?: RequestInit) => completedResponse());
+    await callOpenAI(
+      { requestId: crypto.randomUUID(), images: [jpeg(), jpeg()] },
+      env,
+      fetcher as typeof fetch,
+    );
+    const body = JSON.parse(fetcher.mock.calls[0][1]!.body as string);
+    expect(body.instructions).toContain('A full-bleed photographic back can be a valid reverse');
+    expect(body.instructions).toContain('small copyright/licensing text, card codes');
+    expect(body.instructions).toContain('A serial printed on only one side');
+    expect(body.instructions).toContain(
+      'design/layout difference is not an identity contradiction',
+    );
+    expect(body.instructions).toContain(
+      'Reject a pair only for clear contradictory identity or variant evidence',
+    );
+    expect(body.instructions).toContain('conflicting serials visible on both sides');
+    expect(body.instructions).toContain('affirmative same-side evidence');
+    expect(body.instructions).toContain(
+      'Unknown side or incomplete identity evidence is uncertainty, not proof of a mismatch',
+    );
+    expect(body.instructions).toContain('Do not force a match');
+    expect(body.input[0].content[0].text).toContain(
+      'Report unresolved side or identity evidence as uncertainty',
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it('sends release-year guidance and preserves copyright inference labels and warnings', async () => {
+    const suggested = {
+      suggestions: [
+        {
+          field: 'year',
+          value: '2026',
+          source: 'inference',
+          evidence: 'Back copyright © 2026; product context supports this estimate.',
+          uncertain: false,
+        },
+      ],
+      warnings: ['Release year inferred from copyright; copyright and release years can differ.'],
+    };
+    const fetcher = vi.fn(async (_url: unknown, _options?: RequestInit) =>
+      Response.json({
+        status: 'completed',
+        output: [
+          {
+            type: 'message',
+            content: [{ type: 'output_text', text: JSON.stringify(suggested) }],
+          },
+        ],
+      }),
+    );
+    const result = await callOpenAI(
+      { requestId: crypto.randomUUID(), images: [jpeg(), jpeg()] },
+      env,
+      fetcher as typeof fetch,
+    );
+    expect(result).toEqual(suggested);
+    const { instructions } = JSON.parse(fetcher.mock.calls[0][1]!.body as string);
+    expect(instructions).toContain('Use an explicitly printed product/release year first');
+    expect(instructions).toContain('copyright year may support a release-year inference');
+    expect(instructions).toContain('copyright and release years can differ');
+    expect(instructions).toContain('copyright-based release-year estimates use source=inference');
+    expect(instructions).toContain("'2024 AL Leaders' labels a statistical season");
+    expect(instructions).toContain('retro design year');
+    expect(instructions).toContain('retain a known insert/subset title descriptively');
+    expect(instructions).toContain('product family only when independently supported');
+    expect(instructions).toContain('Do not infer a series number, parallel or base variant');
+    expect(instructions).toContain('preserve the visible script');
+    expect(instructions).toContain('return no suggestions and warn that the pair needs review');
+    expect(instructions).toContain('Do not authenticate signatures');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
   it.each(
     aiModels.flatMap((model) =>
       reasoningEfforts.map((reasoningEffort) => ({ model, reasoningEffort })),

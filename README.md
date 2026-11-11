@@ -43,7 +43,7 @@ No Firebase configuration is needed for local use. `npm ci` downloads dependenci
 
 ## Using the collection
 
-- Collection shows a grid of sets. Open a set to see its cards in a list. Sets with different years, makers or products stay separate. Cards without a set appear under No set.
+- Collection groups cards by release and section, such as 2026 Topps Series 1 · Base, Parallels, Inserts, or Relics & autos. Unknown types stay Unclassified. Different years, makers, leagues and specific products stay separate. A blank product and the generic Baseball card label do not split a set. Cards without a set appear under No set.
 - All cards lists every active card across sets. Players groups cards by player or character name; open a player to see their cards across sets. Archive and Recently deleted remain separate views.
 - Settings > Add test cards creates 12 fictional cards in six sets, with front/back artwork and six players or characters. The cards are marked Test card and tagged `test-card`. They are saved locally and use the normal backup and metadata-sync flow. Adding them again never replaces edits or restores deleted examples. You can edit, archive or delete them like any card.
 - Add a card, import or capture each side, adjust rotation and crop, then choose Use photo. Save card commits the record to your collection. A local draft keeps unfinished edits across reloads.
@@ -56,6 +56,8 @@ No Firebase configuration is needed for local use. `npm ci` downloads dependenci
 - Saved here means the metadata is in this browser. Synced means the current metadata revision reached Firestore. The separate photo count shows how many sides are actually available here. A missing photo is never shown as synced merely because its hash arrived.
 
 The original camera file is not retained by this app. Use photo stores the edited JPEG, with a maximum edge of 2560 pixels and quality 0.92. Keep originals in Photos or Files if you want an archival source beyond the app's edited image. Canvas conversion removes EXIF, including GPS. Check small Japanese print before saving or identifying.
+
+Saved and received photos get a local preview cropped to the detected card edges. Uncertain images keep the full photo. Open a card to Rotate, Adjust crop, or show Original. These preview controls preserve the saved photo bytes and hashes used for identification and backups. They do not send photos to AI. Preview preferences stay on this device; another device creates its own previews after receiving the photos. The preview cache is bounded and rebuilt as needed.
 
 HEIC/HEIF photos use the browser's decoder first, then a bundled local decoder if needed. HEIC conversion runs one image at a time without uploading originals to a conversion service. Native JPEG and PNG imports can run in parallel within a device memory budget. The offline cache includes the decoder. Unsupported or damaged images show an error and can be replaced with a JPEG export. Real camera formats and orientation still need the [iPhone checklist](docs/device-checklist.md).
 

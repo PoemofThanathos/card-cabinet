@@ -800,7 +800,11 @@ export default function App() {
               {(['front', 'back'] as const).map((side) => (
                 <div key={side}>
                   <span className="photo-label">{side}</span>
-                  <PhotoView hash={selected.photos[side]} alt={side + ' of ' + title(selected)} />
+                  <PhotoView
+                    hash={selected.photos[side]}
+                    alt={side + ' of ' + title(selected)}
+                    editable
+                  />
                 </div>
               ))}
             </div>
