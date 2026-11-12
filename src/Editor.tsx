@@ -1,3 +1,4 @@
+import { CatalogueReference } from './CatalogueReference';
 import { useEffect, useState } from 'react';
 import { Save, ScanLine, ChevronDown, Check } from 'lucide-react';
 import { useLiveQuery } from 'dexie-react-hooks';
@@ -96,6 +97,16 @@ export function SuggestionReview({
           </label>
         ))}
       </div>
+      <CatalogueReference
+        fields={{
+          ...card.fields,
+          ...Object.fromEntries(
+            result.suggestions
+              .filter((s) => !s.uncertain && s.value)
+              .map((s) => [s.field, s.value]),
+          ),
+        }}
+      />
       <p className="small muted">
         This does not authenticate signatures, grade condition, or estimate value. Model uncertainty
         is not a calibrated probability.

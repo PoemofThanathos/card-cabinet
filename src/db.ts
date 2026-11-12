@@ -1,4 +1,5 @@
 import Dexie, { type EntityTable, type Table } from 'dexie';
+import type { NormalizedFrameCorners } from './card-frame';
 import {
   type Card,
   type LocalCard,
@@ -20,6 +21,7 @@ export type PhotoDisplay = {
   mode: 'auto' | 'original' | 'manual';
   rotation: number;
   crop: { left: number; top: number; right: number; bottom: number };
+  frameCorners?: NormalizedFrameCorners;
   bytes?: ArrayBuffer;
   type?: string;
   updatedAt: number;

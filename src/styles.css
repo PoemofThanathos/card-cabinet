@@ -1988,3 +1988,16 @@ dd {
     font-size: 10px;
   }
 }
+
+.catalogue-reference {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 0.5rem;
+}
+.catalogue-candidate img {
+  display: block;
+  max-width: min(100%, 240px);
+  max-height: 320px;
+  object-fit: contain;
+}

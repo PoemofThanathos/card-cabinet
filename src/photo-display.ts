@@ -1,8 +1,8 @@
 import { db, photoBlob, type CabinetDB, type Photo, type PhotoDisplay } from './db';
 import { fullCrop, transformPhoto } from './photos';
-import { frameCardPhoto } from './card-frame';
+import { frameCardPhoto, validFrameCorners } from './card-frame';
 
-export type DisplayOptions = Pick<PhotoDisplay, 'mode' | 'rotation' | 'crop'>;
+export type DisplayOptions = Pick<PhotoDisplay, 'mode' | 'rotation' | 'crop' | 'frameCorners'>;
 export const defaultDisplay: DisplayOptions = { mode: 'auto', rotation: 0, crop: fullCrop };
 const pending = new Map<string, Promise<Blob>>();
 
@@ -10,6 +10,9 @@ export function rotateDisplay(options: DisplayOptions): DisplayOptions {
   const { left, top, right, bottom } = options.crop;
   return {
     mode: options.mode,
+    ...(options.mode === 'auto' && options.frameCorners
+      ? { frameCorners: options.frameCorners }
+      : {}),
     rotation: (options.rotation + 90) % 360,
     crop:
       options.mode === 'manual'
@@ -24,6 +27,9 @@ function valid(display?: PhotoDisplay): display is PhotoDisplay {
     display.version === 1 &&
     ['auto', 'original', 'manual'].includes(display.mode) &&
     [0, 90, 180, 270].includes(display.rotation) &&
+    (display.mode !== 'auto' ||
+      display.frameCorners === undefined ||
+      validFrameCorners(display.frameCorners)) &&
     !!display.crop &&
     Object.values(display.crop).every((v) => Number.isFinite(v) && v >= 0 && v <= 100) &&
     display.crop.right > display.crop.left &&
@@ -38,7 +44,8 @@ async function render(photo: Photo, options: DisplayOptions): Promise<Blob> {
     return transformPhoto(original, options.rotation, options.crop, 1600);
   const prepared =
     options.mode === 'auto' ? original : await transformPhoto(original, 0, fullCrop, 1600);
-  const cropped = options.mode === 'auto' ? await frameCardPhoto(prepared) : prepared;
+  const cropped =
+    options.mode === 'auto' ? await frameCardPhoto(prepared, options.frameCorners) : prepared;
   return options.rotation ? transformPhoto(cropped, options.rotation, fullCrop, 1600) : cropped;
 }
 
@@ -58,6 +65,9 @@ async function retainPreview(
       mode: options.mode,
       rotation: options.rotation,
       crop: options.crop,
+      ...(options.mode === 'auto' && options.frameCorners
+        ? { frameCorners: options.frameCorners }
+        : {}),
       hash: photo.hash,
       version: 1,
       bytes,
@@ -126,6 +136,9 @@ export async function changePhotoDisplay(
         mode: options.mode,
         rotation: options.rotation,
         crop: { ...options.crop },
+        ...(options.mode === 'auto' && options.frameCorners
+          ? { frameCorners: options.frameCorners }
+          : {}),
         hash: photo.hash,
         version: 1,
         updatedAt: Math.max(Date.now(), (current?.updatedAt ?? 0) + 1),
@@ -135,8 +148,8 @@ export async function changePhotoDisplay(
       return choice;
     },
   );
-  const blob = await render(photo, options);
-  await retainPreview(photo, options, blob, selected.updatedAt, database);
+  const blob = await render(photo, selected);
+  await retainPreview(photo, selected, blob, selected.updatedAt, database);
 }
 
 export async function croppedPreview(blob: Blob, maxEdge = 800) {

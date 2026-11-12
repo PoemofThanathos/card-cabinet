@@ -25,7 +25,10 @@ import {
 import { frameCardPhoto } from '../src/card-frame';
 import { fullCrop, transformPhoto } from '../src/photos';
 
-vi.mock('../src/card-frame', () => ({ frameCardPhoto: vi.fn() }));
+vi.mock('../src/card-frame', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/card-frame')>()),
+  frameCardPhoto: vi.fn(),
+}));
 vi.mock('../src/photos', () => ({
   fullCrop: { left: 0, top: 0, right: 100, bottom: 100 },
   transformPhoto: vi.fn(),

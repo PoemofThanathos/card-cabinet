@@ -133,3 +133,40 @@ export async function analyzePhotos(
     );
   return result;
 }
+
+export async function findCatalogue(identity: import('./catalogue').CatalogueIdentity) {
+  const { catalogueResultSchema } = await import('./catalogue');
+  const { url, user } = await assertIdentificationReady();
+  const token = await user.getIdToken();
+  const unlimited = await db.transaction('rw', db.settings, async () => {
+    if (!(await setting('aiEnabled', false)))
+      throw new Error('Enable identification in Settings first.');
+    const day = new Date().toISOString().slice(0, 10);
+    const usage = await setting('aiUsage', { day, count: 0 });
+    const count = usage.day === day ? usage.count : 0;
+    const uncapped = await setting('aiUnlimited', false);
+    const limit = Math.min(5, Math.max(1, await setting('aiLimit', 3)));
+    if (!uncapped && count >= limit) throw new Error('This device reached its daily scan limit.');
+    await db.settings.put({ key: 'aiUsage', value: { day, count: count + 1 } });
+    return uncapped;
+  });
+  const response = await fetch(url.replace(/\/$/, '') + '/catalogue', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+    body: JSON.stringify({
+      task: 'catalogue',
+      requestId: crypto.randomUUID(),
+      identity,
+      unlimited,
+    }),
+    signal: AbortSignal.timeout(aiClientTimeoutMs),
+  });
+  const data = (await response.json().catch(() => null)) as { error?: unknown } | null;
+  if (!response.ok)
+    throw new Error(
+      typeof data?.error === 'string'
+        ? data.error
+        : 'Catalogue lookup failed. No automatic retry was sent.',
+    );
+  return catalogueResultSchema.parse(data);
+}

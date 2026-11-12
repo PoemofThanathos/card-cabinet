@@ -1,3 +1,4 @@
+import { catalogueRequestSchema, callCatalogue } from './catalogue';
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from 'jose';
 import { z } from 'zod';
 import { fields, suggestionSchema, type Suggestions } from '../src/model';
@@ -70,6 +71,7 @@ const photoAnalysisRequestSchema = identificationRequestSchema.extend({
   images: z.array(z.string().max(3400000)).min(1).max(2),
 });
 const requestSchema = z.union([identificationRequestSchema, photoAnalysisRequestSchema]);
+const gateRequestSchema = z.union([requestSchema, catalogueRequestSchema]);
 export type IdentificationRequest = z.infer<typeof identificationRequestSchema>;
 export type PhotoAnalysisRequest = z.infer<typeof photoAnalysisRequestSchema>;
 export type ScanRequest = z.infer<typeof requestSchema>;
@@ -166,7 +168,8 @@ export default {
       for (const [k, v] of Object.entries(cors)) headers.set(k, v);
       return new Response(r.body, { status: r.status, headers });
     };
-    if (new URL(request.url).pathname !== '/identify')
+    const path = new URL(request.url).pathname;
+    if (path !== '/identify' && path !== '/catalogue')
       return reply(json({ error: 'Not found.' }, 404));
     if (request.method === 'OPTIONS') return reply(new Response(null, { status: 204 }));
     if (request.method !== 'POST') return reply(json({ error: 'Method not allowed.' }, 405));
@@ -180,15 +183,18 @@ export default {
     } catch {
       return reply(json({ error: 'Sign in again. This account is not authorized.' }, 401));
     }
-    let scan: ScanRequest;
+    let scan: z.infer<typeof gateRequestSchema>;
     try {
-      scan = validateScan(await limitedJson(request));
+      const body = await limitedJson(request, path === '/catalogue' ? 16000 : 6900000);
+      scan = path === '/catalogue' ? catalogueRequestSchema.parse(body) : validateScan(body);
     } catch {
       return reply(
         json(
           {
             error:
-              'Invalid scan. Identification needs two photos; photo analysis accepts one or two. Use metadata-free JPEGs, each 100 to 2560 pixels per side and at most 2.5 MB, with supported model and reasoning choices.',
+              path === '/catalogue'
+                ? 'Invalid catalogue request. Provide the card identity and a new request ID.'
+                : 'Invalid scan. Identification needs two photos; photo analysis accepts one or two. Use metadata-free JPEGs, each 100 to 2560 pixels per side and at most 2.5 MB, with supported model and reasoning choices.',
           },
           400,
         ),
@@ -445,7 +451,7 @@ export class ScanGate {
   async fetch(request: Request) {
     if (this.env.AI_ENABLED !== 'true' || !this.env.OPENAI_API_KEY)
       return json({ error: 'Identification is disabled.' }, 503);
-    const scan = requestSchema.parse(await request.json());
+    const scan = gateRequestSchema.parse(await request.json());
     const error = await this.ctx.blockConcurrencyWhile(async () => {
       const now = Date.now();
       const previous = await this.ctx.storage.get<GateState>('limits');
@@ -464,7 +470,11 @@ export class ScanGate {
     });
     if (error) return json({ error }, 429);
     try {
-      return json(await callOpenAI(scan, this.env));
+      return json(
+        'task' in scan && scan.task === 'catalogue'
+          ? await callCatalogue(scan.identity, this.env.OPENAI_API_KEY!)
+          : await callOpenAI(scan, this.env),
+      );
     } catch (e) {
       return json(
         {

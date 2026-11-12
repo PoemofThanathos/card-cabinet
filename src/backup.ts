@@ -14,6 +14,29 @@ import {
 } from './model';
 import { aiModels, reasoningEfforts } from './ai-options';
 import { reviewPrefix, type BatchReview } from './batch';
+import { validFrameCorners } from './card-frame';
+
+const coordinate = z.number().min(0).max(100);
+const displaySchema = z
+  .object({
+    hash: hashSchema,
+    version: z.literal(1),
+    mode: z.enum(['auto', 'original', 'manual']),
+    rotation: z.union([z.literal(0), z.literal(90), z.literal(180), z.literal(270)]),
+    crop: z
+      .object({ left: coordinate, top: coordinate, right: coordinate, bottom: coordinate })
+      .strict(),
+    frameCorners: z.unknown().optional(),
+  })
+  .strict()
+  .refine(
+    (display) => display.crop.right > display.crop.left && display.crop.bottom > display.crop.top,
+  )
+  .refine(
+    (display) =>
+      display.frameCorners === undefined ||
+      (display.mode === 'auto' && validFrameCorners(display.frameCorners)),
+  );
 
 const importedReviewSchema = z
   .object({
@@ -36,6 +59,7 @@ const manifestSchema = z
     exportedAt: z.iso.datetime(),
     cards: z.array(cardSchema),
     reviews: z.array(importedReviewSchema).optional(),
+    photoDisplays: z.array(displaySchema).optional(),
     photos: z.array(
       z
         .object({
@@ -56,6 +80,7 @@ export type ImportPackage = {
   photos: Photo[];
   missing: string[];
   reviews?: z.infer<typeof importedReviewSchema>[];
+  photoDisplays?: z.infer<typeof displaySchema>[];
 };
 export type ImportRow = {
   card: Card;
@@ -98,6 +123,21 @@ export async function exportPackage(cards: Card[], database: CabinetDB = db) {
     files['photos/' + hash + '.jpg'] = new Uint8Array(photo.bytes);
     photos.push({ hash, size: photo.size, type: 'image/jpeg' });
   }
+  const photoDisplays = [];
+  for (const photo of photos) {
+    const display = await database.photoDisplays.get(photo.hash);
+    if (!display) continue;
+    const candidate = {
+      hash: display.hash,
+      version: display.version,
+      mode: display.mode,
+      rotation: display.rotation,
+      crop: display.crop,
+      ...(display.frameCorners === undefined ? {} : { frameCorners: display.frameCorners }),
+    };
+    const parsed = displaySchema.safeParse(candidate);
+    if (parsed.success) photoDisplays.push(parsed.data);
+  }
   files['manifest.json'] = strToU8(
     JSON.stringify({
       format: 'card-cabinet',
@@ -105,6 +145,7 @@ export async function exportPackage(cards: Card[], database: CabinetDB = db) {
       exportedAt: new Date().toISOString(),
       cards: cards.map(plainCard),
       photos,
+      photoDisplays,
     }),
   );
   if (size + files['manifest.json'].length > PACKAGE_LIMIT)
@@ -144,6 +185,19 @@ export async function readPackage(blob: Blob): Promise<ImportPackage> {
   if (!result.success)
     throw new Error('Unsupported backup version or invalid metadata. Nothing was imported.');
   const manifest = result.data;
+  const referenced = new Set(
+    manifest.cards.flatMap((card) => Object.values(card.photos)).filter(Boolean),
+  );
+  const included = new Set(manifest.photos.map((photo) => photo.hash));
+  if (
+    manifest.photoDisplays &&
+    (new Set(manifest.photoDisplays.map((display) => display.hash)).size !==
+      manifest.photoDisplays.length ||
+      manifest.photoDisplays.some(
+        (display) => !referenced.has(display.hash) || !included.has(display.hash),
+      ))
+  )
+    throw new Error('Invalid or unreferenced photo display settings. Nothing was imported.');
   const cardIds = new Set(manifest.cards.map((card) => card.id));
   if (
     manifest.reviews &&
@@ -181,6 +235,7 @@ export async function readPackage(blob: Blob): Promise<ImportPackage> {
   return {
     cards: manifest.cards,
     reviews: manifest.reviews,
+    photoDisplays: manifest.photoDisplays,
     photos,
     missing: [
       ...new Set(
@@ -221,6 +276,7 @@ export async function applyImport(pack: ImportPackage, rows: ImportRow[], databa
     database.photos,
     database.queue,
     database.settings,
+    database.photoDisplays,
     async () => {
       for (const row of rows) {
         const now = await database.cards.get(row.card.id);
@@ -236,13 +292,18 @@ export async function applyImport(pack: ImportPackage, rows: ImportRow[], databa
           );
       }
       const photoHashes = new Set<string>();
+      const replaceHashes = new Set<string>();
+      const keepHashes = new Set<string>();
       const includePhotos = (card: Card) => {
         for (const hash of Object.values(card.photos)) if (hash) photoHashes.add(hash);
       };
       for (const row of rows) {
         if (row.kind === 'purged' && row.choice !== 'copy') continue;
         if (row.kind !== 'new' && (row.kind === 'same' || row.choice === 'keep')) {
-          if (row.existing && row.existing.status !== 'purged') includePhotos(row.existing);
+          if (row.existing && row.existing.status !== 'purged') {
+            includePhotos(row.existing);
+            for (const hash of Object.values(row.existing.photos)) if (hash) keepHashes.add(hash);
+          }
           continue;
         }
         const card = row.choice === 'copy' ? copyCard(row.card) : row.card;
@@ -250,6 +311,8 @@ export async function applyImport(pack: ImportPackage, rows: ImportRow[], databa
         if (old?.status === 'purged')
           throw new Error('This card was permanently deleted. Import it as a new copy.');
         includePhotos(card);
+        if (row.kind === 'different' && row.choice === 'replace')
+          for (const hash of Object.values(card.photos)) if (hash) replaceHashes.add(hash);
         const version = (old?.localVersion ?? 0) + 1;
         await database.cards.put({
           ...card,
@@ -279,6 +342,29 @@ export async function applyImport(pack: ImportPackage, rows: ImportRow[], databa
         }
       }
       await database.photos.bulkPut(pack.photos.filter((photo) => photoHashes.has(photo.hash)));
+      const incomingHashes = new Set(pack.photos.map((photo) => photo.hash));
+      const referencedHashes = new Set(
+        pack.cards.flatMap((card) => Object.values(card.photos)).filter(Boolean),
+      );
+      for (const candidate of pack.photoDisplays ?? []) {
+        const parsed = displaySchema.safeParse(candidate);
+        if (
+          !parsed.success ||
+          !referencedHashes.has(parsed.data.hash) ||
+          !incomingHashes.has(parsed.data.hash) ||
+          !photoHashes.has(parsed.data.hash)
+        )
+          continue;
+        const display = parsed.data;
+        const existing = await database.photoDisplays.get(display.hash);
+        if (existing && (!replaceHashes.has(display.hash) || keepHashes.has(display.hash)))
+          continue;
+        await database.photoDisplays.put({
+          ...display,
+          frameCorners: validFrameCorners(display.frameCorners) ? display.frameCorners : undefined,
+          updatedAt: Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1),
+        });
+      }
     },
   );
 }

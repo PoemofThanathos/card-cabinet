@@ -1,3 +1,4 @@
+import { CatalogueReference } from './CatalogueReference';
 import { useEffect, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { useRegisterSW } from 'virtual:pwa-register/react';
@@ -819,6 +820,7 @@ export default function App() {
                   </div>
                 ))}
             </dl>
+            <CatalogueReference fields={selected.fields} />
             <p className="small muted">Physical copy ID: {selected.id}</p>
             <div className="detail-actions">
               <button className="primary" onClick={() => edit(selected)}>

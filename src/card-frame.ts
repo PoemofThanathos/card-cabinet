@@ -1,4 +1,30 @@
 export type FramePoint = { x: number; y: number };
+/** Clockwise corners in the original image, with coordinates between zero and one. */
+export type NormalizedFrameCorners = [FramePoint, FramePoint, FramePoint, FramePoint];
+
+export function validFrameCorners(value: unknown): value is NormalizedFrameCorners {
+  if (
+    !Array.isArray(value) ||
+    value.length !== 4 ||
+    value.some(
+      (p) =>
+        !p ||
+        !Number.isFinite(p.x) ||
+        !Number.isFinite(p.y) ||
+        p.x < 0 ||
+        p.x > 1 ||
+        p.y < 0 ||
+        p.y > 1,
+    )
+  )
+    return false;
+  // Positive turns reject crossed, concave, reversed and degenerate frames.
+  return value.every((a, i) => {
+    const b = value[(i + 1) % 4],
+      c = value[(i + 2) % 4];
+    return (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x) > 0.000001;
+  });
+}
 export type CardFrame = {
   /** Clockwise corners, starting at the upper left, in source pixels. */
   corners: [FramePoint, FramePoint, FramePoint, FramePoint];
@@ -280,12 +306,14 @@ export function detectCardFrame(
 
 let pending: Promise<unknown> = Promise.resolve();
 /** Generate a local display copy. The supplied photo and its orientation are preserved. */
-export function frameCardPhoto(blob: Blob): Promise<Blob> {
-  const result = pending.then(() => frameOne(blob)).catch(() => blob);
+export function frameCardPhoto(blob: Blob, corners?: NormalizedFrameCorners): Promise<Blob> {
+  if (corners !== undefined && !validFrameCorners(corners)) return Promise.resolve(blob);
+  const selected = corners?.map((p) => ({ ...p })) as NormalizedFrameCorners | undefined;
+  const result = pending.then(() => frameOne(blob, selected)).catch(() => blob);
   pending = result;
   return result;
 }
-async function frameOne(blob: Blob): Promise<Blob> {
+async function frameOne(blob: Blob, corners?: NormalizedFrameCorners): Promise<Blob> {
   if (blob.size > 40 * 1024 * 1024) return blob;
   const url = URL.createObjectURL(blob),
     image = new Image();
@@ -301,26 +329,33 @@ async function frameOne(blob: Blob): Promise<Blob> {
     const iw = image.naturalWidth,
       ih = image.naturalHeight;
     if (!iw || !ih || iw * ih > 60_000_000) return blob;
-    const scale = Math.min(1, 600 / Math.max(iw, ih));
-    analysis.width = Math.round(iw * scale);
-    analysis.height = Math.round(ih * scale);
-    const ctx = analysis.getContext('2d', { willReadFrequently: true })!;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(image, 0, 0, analysis.width, analysis.height);
-    const frame = detectCardFrame(
-      ctx.getImageData(0, 0, analysis.width, analysis.height).data,
-      analysis.width,
-      analysis.height,
-    );
-    if (!frame) return blob;
+    let selected = corners;
+    if (!selected) {
+      const scale = Math.min(1, 600 / Math.max(iw, ih));
+      analysis.width = Math.round(iw * scale);
+      analysis.height = Math.round(ih * scale);
+      const ctx = analysis.getContext('2d', { willReadFrequently: true })!;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(image, 0, 0, analysis.width, analysis.height);
+      const frame = detectCardFrame(
+        ctx.getImageData(0, 0, analysis.width, analysis.height).data,
+        analysis.width,
+        analysis.height,
+      );
+      if (!frame) return blob;
+      selected = frame.corners.map((p) => ({
+        x: p.x / analysis.width,
+        y: p.y / analysis.height,
+      })) as NormalizedFrameCorners;
+    }
     const sourceScale = Math.min(1, 2400 / Math.max(iw, ih));
     source.width = Math.round(iw * sourceScale);
     source.height = Math.round(ih * sourceScale);
     const s = source.getContext('2d', { willReadFrequently: true })!;
     s.drawImage(image, 0, 0, source.width, source.height);
-    const points = frame.corners.map((p) => ({
-      x: (p.x * source.width) / analysis.width,
-      y: (p.y * source.height) / analysis.height,
+    const points = selected.map((p) => ({
+      x: p.x * source.width,
+      y: p.y * source.height,
     }));
     const [p0, p1, p2, p3] = points;
     const w = (distance(p0, p1) + distance(p3, p2)) / 2,
